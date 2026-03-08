@@ -148,14 +148,43 @@ _TF_MAP = {
 }
 
 # ---------------------------------------------------------------------------
-# Logging setup – one compact line per event
+# Logging setup
 # ---------------------------------------------------------------------------
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s  %(levelname)-5s  %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
-)
+# All log messages go to live_bot.log only – the terminal stays clean.
+# A file handler is attached in run_bot() once the log path is known.
+logging.basicConfig(handlers=[logging.NullHandler()])
 log = logging.getLogger("live_bot")
+log.setLevel(logging.INFO)
+
+# Global file handle used by _journal() for the structured journal blocks
+_journal_fh: object | None = None  # TextIO; set to an open file in run_bot()
+
+_BOT_DIR = os.path.dirname(os.path.abspath(__file__))
+_LOG_FILE = os.path.join(_BOT_DIR, "live_bot.log")
+
+
+def _setup_logging() -> None:
+    """Attach a rotating-capable FileHandler to the module logger."""
+    fh = logging.FileHandler(_LOG_FILE, encoding="utf-8")
+    fh.setLevel(logging.DEBUG)
+    fh.setFormatter(
+        logging.Formatter(
+            "%(asctime)s  %(levelname)-5s  %(message)s",
+            datefmt="%Y-%m-%d %H:%M:%S",
+        )
+    )
+    log.addHandler(fh)
+
+
+def _journal(text: str) -> None:
+    """Append *text* followed by a newline to the journal file."""
+    global _journal_fh  # noqa: PLW0603
+    if _journal_fh is not None:
+        try:
+            _journal_fh.write(text + "\n")
+            _journal_fh.flush()
+        except OSError:
+            pass
 
 # ---------------------------------------------------------------------------
 # Optional Telegram helper
@@ -194,13 +223,7 @@ def _send_telegram(message: str) -> None:
 def _in_session(dt_utc: datetime) -> bool:
     """Return True when *dt_utc* falls within 08:00–17:00 London time."""
     if _LONDON_TZ is None:
-        # pytz not installed – London is UTC+0 (GMT) or UTC+1 (BST).
-        # Without accurate DST data we use UTC+0 as the safe fallback, which
-        # means the session window is slightly conservative during BST.  Install
-        # pytz for correct behaviour: pip install pytz
-        log.warning(
-            "pytz not installed; using UTC as approximation for London time."
-        )
+        # pytz not installed – fall back to UTC (slightly conservative during BST)
         london_hour = dt_utc.hour
     else:
         london_dt = dt_utc.astimezone(_LONDON_TZ)
@@ -482,6 +505,12 @@ def run_bot(
         log.error("ENVIRONMENT must be 'practice' or 'live', got: %r", environment)
         return
 
+    # ------------------------------------------------------------------
+    # Set up file logging + journal
+    # ------------------------------------------------------------------
+    global _journal_fh  # noqa: PLW0603
+    _setup_logging()
+
     client = _oanda_init(account_id, access_token, environment)
     if client is None:
         return
@@ -490,6 +519,13 @@ def run_bot(
     if granularity is None:
         log.error("Unknown timeframe '%s'.  Valid: %s", timeframe, list(_TF_MAP))
         return
+
+    # One-time pytz warning (to log file only)
+    if _LONDON_TZ is None:
+        log.warning(
+            "pytz not installed; using UTC as approximation for London time.  "
+            "Install with: pip install pytz"
+        )
 
     daily_guard = DailyGuard(max_loss_pct=_MAX_DAILY_LOSS_PCT)
     log.info(
@@ -502,13 +538,21 @@ def run_bot(
         f"🤖 SMC Bot started – <b>{','.join(symbols)}</b> {timeframe}"
     )
 
+    print(
+        f"[{datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M')}] "
+        f"Bot started – {len(symbols)} symbols – tf={timeframe} – env={environment}"
+    )
+
     # Per-symbol tracking of the last processed bar time
     last_bar_times: dict[str, "pd.Timestamp | None"] = {sym: None for sym in symbols}
 
+    # Open journal file inside the try/finally so it is always closed on exit
     try:
+        _journal_fh = open(_LOG_FILE, "a", encoding="utf-8")  # noqa: SIM115
         while True:
             now_utc = datetime.now(timezone.utc)
             today_int = now_utc.date().toordinal()
+            cycle_ts = now_utc.strftime("%Y-%m-%d %H:%M:%S UTC")
 
             equity = _get_equity(client, account_id)
             daily_guard.update(equity, today_int)
@@ -520,6 +564,10 @@ def run_bot(
                 log.warning(
                     "Daily loss limit (%.1f%%) reached – no new trades today.",
                     _MAX_DAILY_LOSS_PCT,
+                )
+                print(
+                    f"[{now_utc.strftime('%Y-%m-%d %H:%M')}] "
+                    f"⚠  Daily loss limit reached – no new trades.  equity {equity:.2f}"
                 )
                 time.sleep(_POLL_INTERVAL_SECONDS)
                 continue
@@ -536,8 +584,27 @@ def run_bot(
             # ----------------------------------------------------------
             open_count = _count_open_trades(client, account_id)
             if open_count >= _MAX_OPEN_TRADES:
+                print(
+                    f"[{now_utc.strftime('%Y-%m-%d %H:%M')}] "
+                    f"Checked {len(symbols)} symbols – max open trades ({open_count}) reached – "
+                    f"equity {equity:.2f}"
+                )
                 time.sleep(_POLL_INTERVAL_SECONDS)
                 continue
+
+            # ----------------------------------------------------------
+            # Per-cycle journal header
+            # ----------------------------------------------------------
+            _journal("=" * 80)
+            _journal(f"[{cycle_ts}] CYCLE")
+            _journal("-" * 80)
+            _journal(f"{'Symbol':<12} {'Spread(pips)':>13}  {'New Bar':>7}  Signal")
+            _journal("-" * 80)
+
+            new_signals = 0
+            cycle_rows: list[str] = []
+            # Each item is a list of lines for the detailed trade block
+            trade_blocks: list[list[str]] = []
 
             # ----------------------------------------------------------
             # Iterate over every symbol in one loop pass
@@ -547,21 +614,36 @@ def run_bot(
                 # open more trades than allowed if earlier symbols filled it.
                 open_count = _count_open_trades(client, account_id)
                 if open_count >= _MAX_OPEN_TRADES:
+                    cycle_rows.append(
+                        f"{symbol:<12} {'--':>13}  {'--':>7}  max open trades reached"
+                    )
                     break
 
                 # Spread filter (per symbol)
                 spread = _get_spread_pips(client, account_id, symbol)
+                spread_str = f"{spread:.3f}" if spread != float("inf") else "inf"
                 if spread >= _MAX_SPREAD_PIPS:
+                    cycle_rows.append(
+                        f"{symbol:<12} {spread_str:>13}  {'--':>7}  spread too wide – skipped"
+                    )
                     continue
 
                 # Fetch OHLCV + compute SMC signals
                 df = _fetch_ohlcv(client, symbol, granularity, _BARS_NEEDED)
                 if df is None or len(df) < 50:
+                    cycle_rows.append(
+                        f"{symbol:<12} {spread_str:>13}  {'--':>7}  no data"
+                    )
                     continue
 
                 # Only process a new signal when a new bar has closed
                 current_bar_time = df.index[-1]
-                if current_bar_time == last_bar_times[symbol]:
+                new_bar = current_bar_time != last_bar_times[symbol]
+                new_bar_str = "YES" if new_bar else "NO"
+                if not new_bar:
+                    cycle_rows.append(
+                        f"{symbol:<12} {spread_str:>13}  {new_bar_str:>7}  (waiting for new bar)"
+                    )
                     continue
                 last_bar_times[symbol] = current_bar_time
 
@@ -578,6 +660,9 @@ def run_bot(
                     )
                 except Exception as exc:  # noqa: BLE001
                     log.error("[%s] generate_signals error: %s", symbol, exc)
+                    cycle_rows.append(
+                        f"{symbol:<12} {spread_str:>13}  {new_bar_str:>7}  generate_signals error"
+                    )
                     continue
 
                 # Evaluate only the last completed bar (index -2; -1 is the
@@ -586,6 +671,9 @@ def run_bot(
                 signal = int(last_closed["signal"])
 
                 if signal == 0 or np.isnan(last_closed["entry"]):
+                    cycle_rows.append(
+                        f"{symbol:<12} {spread_str:>13}  {new_bar_str:>7}  no signal"
+                    )
                     continue
 
                 direction_str = "LONG" if signal == 1 else "SHORT"
@@ -597,13 +685,46 @@ def run_bot(
                 lot = float(last_closed["lot_size"])
 
                 if np.isnan(sl) or np.isnan(tp) or np.isnan(lot) or lot <= 0:
+                    cycle_rows.append(
+                        f"{symbol:<12} {spread_str:>13}  {new_bar_str:>7}  invalid signal values"
+                    )
                     continue
+
+                cycle_rows.append(
+                    f"{symbol:<12} {spread_str:>13}  {new_bar_str:>7}  "
+                    f"{direction_str} entry={entry:.5f} sl={sl:.5f} tp={tp:.5f}"
+                )
 
                 # Place the order
                 success = _place_order(
                     client, account_id, symbol, signal, sl, tp, lot
                 )
                 if success:
+                    new_signals += 1
+                    equity_after = _get_equity(client, account_id)
+
+                    # ── Terminal: bold trade alert ──────────────────────
+                    print(
+                        f"\033[1m[{symbol}] TRADE {direction_str} @ {entry:.5f}"
+                        f"  sl={sl:.5f}  tp={tp:.5f}  RR={rr:.2f}  lot={lot:.2f}\033[0m"
+                    )
+
+                    # Collect trade block lines (written to journal after cycle table)
+                    trade_blocks.append([
+                        "",
+                        "─" * 80,
+                        f"[TRADE] [{cycle_ts}] {symbol} {direction_str}",
+                        f"  Entry    : {entry:.5f}",
+                        f"  Stop Loss: {sl:.5f}",
+                        f"  Take Profit: {tp:.5f}",
+                        f"  RR Ratio : {rr:.2f}",
+                        f"  Lot Size : {lot:.2f}",
+                        "  Reason   : FVG + BOS + Liquidity + Discount Zone",
+                        f"  Equity   : {equity:.2f} → {equity_after:.2f}",
+                        "─" * 80,
+                        "",
+                    ])
+
                     log.info(
                         "[%s] TRADE %s @ %.5f  sl=%.5f  tp=%.5f  RR=%.2f  lot=%.2f",
                         symbol,
@@ -619,11 +740,49 @@ def run_bot(
                         f"Entry: <b>{entry:.5f}</b>  SL: {sl:.5f}  TP: {tp:.5f}  RR: {rr:.2f}"
                     )
 
+            # ── Write cycle table rows to journal ────────────────────────
+            for row in cycle_rows:
+                _journal(row)
+            _journal("-" * 80)
+
+            open_count = _count_open_trades(client, account_id)
+            _journal(
+                f"Summary: {len(symbols)} symbols | {new_signals} new signal(s) | "
+                f"{open_count} open trade(s) | equity={equity:.2f}"
+            )
+            _journal("=" * 80)
+
+            # ── Write detailed trade blocks below the cycle summary ──────
+            for block in trade_blocks:
+                for line in block:
+                    _journal(line)
+
+            _journal("")
+
+            # ── Terminal: one clean summary line per cycle ───────────────
+            print(
+                f"[{now_utc.strftime('%Y-%m-%d %H:%M')}] "
+                f"Checked {len(symbols)} symbols – "
+                f"{new_signals} new signal{'s' if new_signals != 1 else ''} – "
+                f"{open_count} open trade{'s' if open_count != 1 else ''} – "
+                f"equity {equity:.2f}"
+            )
+
             time.sleep(_POLL_INTERVAL_SECONDS)
 
     except KeyboardInterrupt:
         log.info("Bot stopped by user.")
         _send_telegram("🛑 SMC Bot stopped.")
+        print(
+            f"\n[{datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M')}] "
+            "Bot stopped by user."
+        )
+    finally:
+        if _journal_fh is not None:
+            try:
+                _journal_fh.close()
+            except OSError as exc:
+                log.warning("Error closing journal file: %s", exc)
 
 
 # ---------------------------------------------------------------------------
