@@ -22,6 +22,9 @@ _TRADES_LOG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tra
 _REASON_LONG = "Bull FVG + Bull BOS + Liq Sweep Below + Discount Zone"
 _REASON_SHORT = "Bear FVG + Bear BOS + Liq Sweep Above + Premium Zone"
 
+# Fixed risk per trade in account percentage (like a real trader risking 1% per trade)
+_RISK_PERCENT = 1.0
+
 
 # ---------------------------------------------------------------------------
 
@@ -98,11 +101,15 @@ def backtest_pair(df: pd.DataFrame, pair_name: str) -> dict:
     trade_direction = ""
     trade_reason = ""
 
-    # Running equity curve (mark-to-market) for improved drawdown calculation
-    equity_curve: list[float] = []
-    realized_equity = 0.0
+    # Running equity curve (account %, starting at 100) for max drawdown
+    equity = 100.0
+    equity_curve: list[float] = [100.0]
 
-    def _record_trade(result: str, pnl_raw: float, pnl_pct: float) -> None:
+    def _record_trade(result: str, pnl_pct: float) -> None:
+        nonlocal equity
+        equity += pnl_pct
+        equity_curve.append(equity)
+        pnl_list.append(pnl_pct)
         trade_records.append(
             {
                 "timestamp": trade_ts,
@@ -115,59 +122,36 @@ def backtest_pair(df: pd.DataFrame, pair_name: str) -> dict:
                 "reason_entry": trade_reason,
                 "result": result,
                 "pnl": round(pnl_pct, 4),
+                "risk_pct_used": _RISK_PERCENT,
+                "pnl_pct": round(pnl_pct, 4),
+                "equity_after": round(equity, 4),
             }
         )
         tqdm.write(
             f"[{pair_name}] {trade_direction} @ {trade_entry:.5f}"
             f" → TP {trade_tp:.5f} (RR {trade_rr:.2f})"
-            f" → {result} {pnl_pct:+.4f}%"
+            f" → {result} {pnl_pct:+.4f}%  Equity: {equity:.2f}%"
         )
 
     for i in range(n):
-        # --- Mark-to-market equity for running drawdown ---
-        if in_trade:
-            if trade_signal == 1:
-                mtm = close_arr[i] - trade_entry
-            else:
-                mtm = trade_entry - close_arr[i]
-            equity_curve.append(realized_equity + mtm)
-        else:
-            equity_curve.append(realized_equity)
-
         if in_trade:
             # Full SL exit (long)
             if trade_signal == 1:
                 if low_arr[i] <= trade_sl:
-                    pnl_raw = trade_sl - trade_entry
-                    pnl_pct = pnl_raw / trade_entry * 100.0
-                    realized_equity += pnl_raw
-                    pnl_list.append(pnl_raw)
-                    _record_trade("LOSS", pnl_raw, pnl_pct)
+                    _record_trade("LOSS", -_RISK_PERCENT)
                     in_trade = False
                 # Full TP exit (long)
                 elif high_arr[i] >= trade_tp:
-                    pnl_raw = trade_tp - trade_entry
-                    pnl_pct = pnl_raw / trade_entry * 100.0
-                    realized_equity += pnl_raw
-                    pnl_list.append(pnl_raw)
-                    _record_trade("WIN", pnl_raw, pnl_pct)
+                    _record_trade("WIN", _RISK_PERCENT * trade_rr)
                     in_trade = False
             # Full SL exit (short)
             elif trade_signal == -1:
                 if high_arr[i] >= trade_sl:
-                    pnl_raw = trade_entry - trade_sl  # negative: sl > entry for shorts
-                    pnl_pct = pnl_raw / trade_entry * 100.0
-                    realized_equity += pnl_raw
-                    pnl_list.append(pnl_raw)
-                    _record_trade("LOSS", pnl_raw, pnl_pct)
+                    _record_trade("LOSS", -_RISK_PERCENT)
                     in_trade = False
                 # Full TP exit (short)
                 elif low_arr[i] <= trade_tp:
-                    pnl_raw = trade_entry - trade_tp
-                    pnl_pct = pnl_raw / trade_entry * 100.0
-                    realized_equity += pnl_raw
-                    pnl_list.append(pnl_raw)
-                    _record_trade("WIN", pnl_raw, pnl_pct)
+                    _record_trade("WIN", _RISK_PERCENT * trade_rr)
                     in_trade = False
 
         if not in_trade and signal_arr[i] != 0 and not np.isnan(entry_arr[i]):
@@ -181,18 +165,20 @@ def backtest_pair(df: pd.DataFrame, pair_name: str) -> dict:
             trade_direction = "LONG" if trade_signal == 1 else "SHORT"
             trade_reason = _REASON_LONG if trade_signal == 1 else _REASON_SHORT
 
-    # Close any open trade at the last close price
+    # Close any open trade at the last close price (proportional account PnL)
     if in_trade:
         last_close = sig_df["close"].iloc[-1]
-        if trade_signal == 1:
-            pnl_raw = last_close - trade_entry
+        sl_dist = abs(trade_entry - trade_sl)
+        if sl_dist > 0:
+            if trade_signal == 1:
+                price_pnl = last_close - trade_entry
+            else:
+                price_pnl = trade_entry - last_close
+            pnl_pct = price_pnl / sl_dist * _RISK_PERCENT
         else:
-            pnl_raw = trade_entry - last_close
-        pnl_pct = pnl_raw / trade_entry * 100.0
-        realized_equity += pnl_raw
-        pnl_list.append(pnl_raw)
-        result = "WIN" if pnl_raw > 0 else "LOSS"
-        _record_trade(result, pnl_raw, pnl_pct)
+            pnl_pct = 0.0
+        result = "WIN" if pnl_pct > 0 else "LOSS"
+        _record_trade(result, pnl_pct)
 
     # ------------------------------------------------------------------
     # 4. Compute statistics
@@ -213,14 +199,11 @@ def backtest_pair(df: pd.DataFrame, pair_name: str) -> dict:
     profit_factor = gross_profit / gross_loss if gross_loss > 0 else float("inf")
     net_profit = float(pnl_arr.sum())
 
-    # Improved max drawdown: running equity curve (mark-to-market during open trades)
-    if len(equity_curve) > 0:
-        eq_arr = np.array(equity_curve, dtype=np.float64)
-        running_peak = np.maximum.accumulate(eq_arr)
-        drawdowns = running_peak - eq_arr
-        max_dd = float(drawdowns.max())
-    else:
-        max_dd = 0.0
+    # Real max drawdown: peak-to-trough on the running equity curve (account %)
+    eq_arr = np.array(equity_curve, dtype=np.float64)
+    running_peak = np.maximum.accumulate(eq_arr)
+    drawdowns = running_peak - eq_arr
+    max_dd = float(drawdowns.max())
 
     return {
         "pair": pair_name,
@@ -271,7 +254,7 @@ def run_backtest(last_years: int = None) -> dict:
     ):
         df = data_dict[pair_name]
 
-        # Fix: filter truly the last X years per pair using each pair's own max date
+        # Fix 1: filter truly the last X years per pair using each pair's own max date
         if last_years is not None:
             df = df[df.index >= df.index.max() - pd.DateOffset(years=last_years)]
 
@@ -280,13 +263,14 @@ def run_backtest(last_years: int = None) -> dict:
         all_trade_records.extend(stats.get("trade_records", []))
 
     # ------------------------------------------------------------------
-    # Write trades_log.csv
+    # Write trades_log.csv with extended columns
     # ------------------------------------------------------------------
     if all_trade_records:
         trades_df = pd.DataFrame(
             all_trade_records,
             columns=["timestamp", "pair", "direction", "entry", "sl", "tp",
-                     "rr", "reason_entry", "result", "pnl"],
+                     "rr", "reason_entry", "result", "pnl",
+                     "risk_pct_used", "pnl_pct", "equity_after"],
         )
         trades_df.to_csv(_TRADES_LOG_FILE, index=False)
 
@@ -309,18 +293,20 @@ def run_backtest(last_years: int = None) -> dict:
         gross_profit / gross_loss if gross_loss > 0 else float("inf")
     )
 
-    # Max DD on combined PnL stream (approximated from per-pair net profits)
-    net_profits = np.array(
-        [stats["net_profit"] for stats in results.values()], dtype=np.float64
-    )
-    cum_total = np.cumsum(net_profits)
-    if len(cum_total) > 0:
-        running_max = np.maximum.accumulate(cum_total)
-        overall_max_dd = float((running_max - cum_total).max())
+    # Overall max DD: peak-to-trough on the combined account PnL stream
+    all_pnl: list[float] = []
+    for s in results.values():
+        for r in s.get("trade_records", []):
+            all_pnl.append(r["pnl_pct"])
+    if all_pnl:
+        pnl_cumsum = np.cumsum(np.array(all_pnl, dtype=np.float64))
+        eq_combined = np.concatenate([[100.0], 100.0 + pnl_cumsum])
+        running_max = np.maximum.accumulate(eq_combined)
+        overall_max_dd = float((running_max - eq_combined).max())
+        total_net_pnl = float(eq_combined[-1] - 100.0)
     else:
         overall_max_dd = 0.0
-
-    total_net_pnl = float(cum_total[-1]) if len(cum_total) > 0 else 0.0
+        total_net_pnl = 0.0
 
     summary = {
         "total_trades": total_trades,
@@ -330,7 +316,7 @@ def run_backtest(last_years: int = None) -> dict:
         "total_return_pct": total_net_pnl,
     }
 
-    print("\nDetaillierte Trades gespeichert in trades_log.csv")
+    print("\nDetaillierte Trades + Equity in trades_log.csv gespeichert")
 
     return {"summary": summary, "results": results}
 
@@ -364,5 +350,8 @@ if __name__ == "__main__":
     display = {k: v for k, v in stats.items() if k != "trade_records"}
     print(display)
     print(f"Trade records logged: {len(stats['trade_records'])}")
+    if stats["trade_records"]:
+        print("\nFirst trade record columns:", list(stats["trade_records"][0].keys()))
+        print("First trade record:", stats["trade_records"][0])
 
     print("\nSelf-test complete. Use run_backtest() after populating the data/ folder for multi-pair tests.")
