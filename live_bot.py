@@ -2,7 +2,13 @@
 
 Usage
 -----
-    python live_bot.py --symbol EURUSD --timeframe M5 [--magic 123456]
+    python live_bot.py [--symbols EURUSD,GBPUSD,USDJPY] [--timeframe M5] [--magic 123456]
+
+    # Trade all 10 default major pairs simultaneously:
+    python live_bot.py
+
+    # Trade a custom set of symbols:
+    python live_bot.py --symbols EURUSD,GBPUSD,USDJPY
 
 Environment variables (optional)
 ----------------------------------
@@ -12,12 +18,12 @@ Environment variables (optional)
     TELEGRAM_TOKEN  – Bot token for Telegram notifications
     TELEGRAM_CHAT_ID– Chat / channel ID for Telegram notifications
 
-Safeguards
-----------
-    * Max 3 open trades at any time
+Safeguards (all GLOBAL across all symbols)
+------------------------------------------
+    * Max 3 open trades at any time (across all symbols)
     * Max 3 % daily loss (relative to start-of-day equity)
     * Only trades during London + NY session: 08:00–17:00 London time
-    * Spread filter: < 0.6 pips
+    * Spread filter: < 0.6 pips (evaluated per symbol)
 
 Rules (same as backtester / smc_strategy)
 ------------------------------------------
@@ -67,6 +73,12 @@ _MIN_RR = 2.0
 _MAX_OPEN_TRADES = 3
 _MAX_DAILY_LOSS_PCT = 3.0  # % of start-of-day equity
 _POLL_INTERVAL_SECONDS = 60
+
+# Default list of major pairs traded simultaneously in multi-symbol mode
+_DEFAULT_SYMBOLS = [
+    "EURUSD", "GBPUSD", "USDJPY", "AUDUSD", "USDCAD",
+    "NZDUSD", "EURJPY", "GBPJPY", "USDCHF", "EURGBP",
+]
 
 # Number of M5 bars to fetch for signal computation (must be > lookback used
 # inside generate_signals, which defaults to 10; 200 bars gives comfortable
@@ -321,18 +333,19 @@ class DailyGuard:
 # ---------------------------------------------------------------------------
 
 def run_bot(
-    symbol: str,
+    symbols: list[str] | None = None,
     timeframe: str = "M5",
     magic: int = 234567,
     login: int | None = None,
     password: str | None = None,
     server: str | None = None,
 ) -> None:
-    """Start the live/paper trading loop.
+    """Start the live/paper trading loop for multiple symbols simultaneously.
 
     Parameters
     ----------
-    symbol    : MT5 symbol string, e.g. ``"EURUSD"``.
+    symbols   : List of MT5 symbol strings, e.g. ``["EURUSD", "GBPUSD"]``.
+                Defaults to all 10 major pairs when ``None``.
     timeframe : Timeframe string key from ``_TF_MAP`` (default ``"M5"``).
     magic     : Unique magic number used to identify bot orders.
     login     : MT5 account login (int).  Falls back to ``MT5_LOGIN`` env var.
@@ -342,6 +355,9 @@ def run_bot(
     if not _MT5_AVAILABLE:
         log.error("MetaTrader5 package is not installed.  Run: pip install MetaTrader5")
         return
+
+    if not symbols:
+        symbols = list(_DEFAULT_SYMBOLS)
 
     # Resolve credentials from env vars if not passed directly
     if login is None:
@@ -361,10 +377,18 @@ def run_bot(
         return
 
     daily_guard = DailyGuard(max_loss_pct=_MAX_DAILY_LOSS_PCT)
-    log.info("Bot started – symbol=%s  tf=%s  magic=%s", symbol, timeframe, magic)
-    _send_telegram(f"🤖 SMC Bot started – <b>{symbol}</b> {timeframe}")
+    log.info(
+        "Bot started – symbols=%s  tf=%s  magic=%s",
+        ",".join(symbols),
+        timeframe,
+        magic,
+    )
+    _send_telegram(
+        f"🤖 SMC Bot started – <b>{','.join(symbols)}</b> {timeframe}"
+    )
 
-    last_bar_time: pd.Timestamp | None = None
+    # Per-symbol tracking of the last processed bar time
+    last_bar_times: dict[str, pd.Timestamp | None] = {sym: None for sym in symbols}
 
     try:
         while True:
@@ -375,7 +399,7 @@ def run_bot(
             daily_guard.update(equity, today_int)
 
             # ----------------------------------------------------------
-            # Safeguard 1: daily loss limit
+            # Safeguard 1: daily loss limit (global)
             # ----------------------------------------------------------
             if daily_guard.is_limit_hit(equity):
                 log.warning(
@@ -386,22 +410,14 @@ def run_bot(
                 continue
 
             # ----------------------------------------------------------
-            # Session filter
+            # Session filter (global)
             # ----------------------------------------------------------
             if not _in_session(now_utc):
                 time.sleep(_POLL_INTERVAL_SECONDS)
                 continue
 
             # ----------------------------------------------------------
-            # Spread filter
-            # ----------------------------------------------------------
-            spread = _get_spread_pips(symbol)
-            if spread >= _MAX_SPREAD_PIPS:
-                time.sleep(_POLL_INTERVAL_SECONDS)
-                continue
-
-            # ----------------------------------------------------------
-            # Safeguard 2: max open trades
+            # Safeguard 2: max open trades (global, across all symbols)
             # ----------------------------------------------------------
             open_count = _count_open_trades(magic)
             if open_count >= _MAX_OPEN_TRADES:
@@ -409,72 +425,82 @@ def run_bot(
                 continue
 
             # ----------------------------------------------------------
-            # Fetch OHLCV + compute SMC signals
+            # Iterate over every symbol in one loop pass
             # ----------------------------------------------------------
-            df = _fetch_ohlcv(symbol, tf_id, _BARS_NEEDED)
-            if df is None or len(df) < 50:
-                time.sleep(_POLL_INTERVAL_SECONDS)
-                continue
+            for symbol in symbols:
+                # Re-check global trade cap inside the loop so we don't
+                # open more trades than allowed if earlier symbols filled it.
+                open_count = _count_open_trades(magic)
+                if open_count >= _MAX_OPEN_TRADES:
+                    break
 
-            # Only process a new signal when a new bar has closed
-            current_bar_time = df.index[-1]
-            if current_bar_time == last_bar_time:
-                time.sleep(_POLL_INTERVAL_SECONDS)
-                continue
-            last_bar_time = current_bar_time
+                # Spread filter (per symbol)
+                spread = _get_spread_pips(symbol)
+                if spread >= _MAX_SPREAD_PIPS:
+                    continue
 
-            balance = _get_balance()
-            try:
-                sig_df = generate_signals(
-                    df,
-                    risk_percent=_RISK_PERCENT,
-                    account_balance=balance,
-                    min_rr=_MIN_RR,
-                )
-            except Exception as exc:  # noqa: BLE001
-                log.error("generate_signals error: %s", exc)
-                time.sleep(_POLL_INTERVAL_SECONDS)
-                continue
+                # Fetch OHLCV + compute SMC signals
+                df = _fetch_ohlcv(symbol, tf_id, _BARS_NEEDED)
+                if df is None or len(df) < 50:
+                    continue
 
-            # Evaluate only the last completed bar (index -2; -1 is the live
-            # candle still forming)
-            last_closed = sig_df.iloc[-2] if len(sig_df) >= 2 else sig_df.iloc[-1]
-            signal = int(last_closed["signal"])
+                # Only process a new signal when a new bar has closed
+                current_bar_time = df.index[-1]
+                if current_bar_time == last_bar_times[symbol]:
+                    continue
+                last_bar_times[symbol] = current_bar_time
 
-            if signal == 0 or np.isnan(last_closed["entry"]):
-                time.sleep(_POLL_INTERVAL_SECONDS)
-                continue
+                # Fetch fresh balance before sizing each trade so that a
+                # position placed for an earlier symbol is reflected here.
+                balance = _get_balance()
 
-            direction_str = "LONG" if signal == 1 else "SHORT"
-            entry = float(last_closed["entry"])
-            sl = float(last_closed["sl"])
-            tp = float(last_closed["tp"])
-            rr = float(last_closed["rr_ratio"])
-            lot = float(last_closed["lot_size"])
+                try:
+                    sig_df = generate_signals(
+                        df,
+                        risk_percent=_RISK_PERCENT,
+                        account_balance=balance,
+                        min_rr=_MIN_RR,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    log.error("[%s] generate_signals error: %s", symbol, exc)
+                    continue
 
-            if np.isnan(sl) or np.isnan(tp) or np.isnan(lot) or lot <= 0:
-                time.sleep(_POLL_INTERVAL_SECONDS)
-                continue
+                # Evaluate only the last completed bar (index -2; -1 is the
+                # live candle still forming)
+                last_closed = sig_df.iloc[-2] if len(sig_df) >= 2 else sig_df.iloc[-1]
+                signal = int(last_closed["signal"])
 
-            # ----------------------------------------------------------
-            # Place the order
-            # ----------------------------------------------------------
-            success = _place_order(symbol, signal, entry, sl, tp, lot, magic)
-            if success:
-                log.info(
-                    "TRADE  %s %s  entry=%.5f  sl=%.5f  tp=%.5f  RR=%.2f  lot=%.2f",
-                    direction_str,
-                    symbol,
-                    entry,
-                    sl,
-                    tp,
-                    rr,
-                    lot,
-                )
-                _send_telegram(
-                    f"📈 {direction_str} {symbol}\n"
-                    f"Entry: <b>{entry:.5f}</b>  SL: {sl:.5f}  TP: {tp:.5f}  RR: {rr:.2f}"
-                )
+                if signal == 0 or np.isnan(last_closed["entry"]):
+                    continue
+
+                direction_str = "LONG" if signal == 1 else "SHORT"
+                trade_emoji = "📈" if signal == 1 else "📉"
+                entry = float(last_closed["entry"])
+                sl = float(last_closed["sl"])
+                tp = float(last_closed["tp"])
+                rr = float(last_closed["rr_ratio"])
+                lot = float(last_closed["lot_size"])
+
+                if np.isnan(sl) or np.isnan(tp) or np.isnan(lot) or lot <= 0:
+                    continue
+
+                # Place the order
+                success = _place_order(symbol, signal, entry, sl, tp, lot, magic)
+                if success:
+                    log.info(
+                        "[%s] TRADE %s @ %.5f  sl=%.5f  tp=%.5f  RR=%.2f  lot=%.2f",
+                        symbol,
+                        direction_str,
+                        entry,
+                        sl,
+                        tp,
+                        rr,
+                        lot,
+                    )
+                    _send_telegram(
+                        f"[{symbol}] {trade_emoji} {direction_str}\n"
+                        f"Entry: <b>{entry:.5f}</b>  SL: {sl:.5f}  TP: {tp:.5f}  RR: {rr:.2f}"
+                    )
 
             time.sleep(_POLL_INTERVAL_SECONDS)
 
@@ -492,7 +518,16 @@ def run_bot(
 
 def _parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="SMC live/paper trading bot for MT5")
-    p.add_argument("--symbol", default="EURUSD", help="MT5 symbol (default: EURUSD)")
+    p.add_argument(
+        "--symbols",
+        default=None,
+        help=(
+            "Comma-separated list of MT5 symbols to trade simultaneously "
+            "(default: all 10 major pairs: "
+            + ",".join(_DEFAULT_SYMBOLS)
+            + ")"
+        ),
+    )
     p.add_argument(
         "--timeframe",
         default="M5",
@@ -508,8 +543,11 @@ def _parse_args() -> argparse.Namespace:
 
 if __name__ == "__main__":
     args = _parse_args()
+    symbols: list[str] | None = None
+    if args.symbols:
+        symbols = [s.strip().upper() for s in args.symbols.split(",") if s.strip()]
     run_bot(
-        symbol=args.symbol,
+        symbols=symbols,
         timeframe=args.timeframe,
         magic=args.magic,
         login=args.login,
