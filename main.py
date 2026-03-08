@@ -3,7 +3,6 @@ from backtester import run_backtest
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--folder", default="data", help="Ordner mit allen CSV-Dateien")
     parser.add_argument(
         "--last_years",
         type=int,
@@ -18,7 +17,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     print("🚀 Starte SMC Backtest...")
-    raw = run_backtest(args.folder, args.last_years)
+    raw = run_backtest(args.last_years)
     summary = raw["summary"]
 
     results = {

@@ -165,14 +165,11 @@ def backtest_pair(df: pd.DataFrame, pair_name: str) -> dict:
 
 # ---------------------------------------------------------------------------
 
-def run_backtest(folder_path: str, last_years: int = None) -> dict:
-    """Run a backtest across all pairs found in *folder_path*.
+def run_backtest(last_years: int = None) -> dict:
+    """Run a backtest across all pairs found in the project's data folder.
 
     Parameters
     ----------
-    folder_path : str
-        Directory that contains ``*.csv`` files readable by
-        :func:`data_loader.load_all_pairs`.
     last_years : int, optional
         When given, each pair's DataFrame is trimmed to the last
         *last_years* calendar years before backtesting.
@@ -183,7 +180,7 @@ def run_backtest(folder_path: str, last_years: int = None) -> dict:
         ``summary`` key contains overall aggregated statistics;
         ``results`` key maps each pair name to its individual stats dict.
     """
-    data_dict = load_all_pairs(folder_path)
+    data_dict = load_all_pairs()
     pair_names = list(data_dict.keys())
 
     results: dict[str, dict] = {}
@@ -250,7 +247,6 @@ def run_backtest(folder_path: str, last_years: int = None) -> dict:
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
     import os
-    import tempfile
 
     print("Running backtester self-test with dummy data …")
 
@@ -275,26 +271,4 @@ if __name__ == "__main__":
     stats = backtest_pair(dummy_df, "DUMMY")
     print(stats)
 
-    # ---- Multi-pair test via run_backtest ----
-    print("\n[2] run_backtest …")
-    with tempfile.TemporaryDirectory() as tmp_dir:
-        # Write dummy CSV in histdata format
-        rows = []
-        for ts, row in dummy_df.iterrows():
-            rows.append(
-                f"{ts.strftime('%Y.%m.%d')},{ts.strftime('%H:%M')},"
-                f"{row['open']:.5f},{row['high']:.5f},"
-                f"{row['low']:.5f},{row['close']:.5f},{int(row['volume'])}"
-            )
-        csv_path = os.path.join(tmp_dir, "DUMMY.csv")
-        with open(csv_path, "w") as f:
-            f.write("\n".join(rows))
-
-        bt_result = run_backtest(tmp_dir)
-
-    print("\nSummary:")
-    for k, v in bt_result["summary"].items():
-        print(f"  {k}: {v}")
-    print("\nPer-pair results:")
-    for pair, res in bt_result["results"].items():
-        print(f"  {pair}: {res}")
+    print("\nSelf-test complete. Use run_backtest() after populating the data/ folder for multi-pair tests.")
