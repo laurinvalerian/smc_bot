@@ -10,8 +10,9 @@ Usage
 
 Outputs
 -------
-  optimization_results.csv  – all parameter combinations with metrics
-  top_15.txt                – top 15 combinations sorted by Score
+  optimization_results.csv  – all parameter combinations with metrics,
+                              sorted descending by test_net_profit_pct
+  top_20_net_profit.txt     – top 20 combinations sorted by Net Profit
 """
 
 import multiprocessing
