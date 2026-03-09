@@ -8,8 +8,14 @@ run in parallel via :mod:`multiprocessing`.
 
 Bot configuration
 -----------------
-* Bots 01–10 : 10 major FX pairs on M5
-* Bots 11–20 : same 10 pairs on H1
+* All 20 bots trade **all 10 major FX pairs simultaneously** on M5 – identical
+  to the multi-symbol mode of ``live_bot.py``.  The only difference between
+  bots is the magic number, which allows positions to be tracked separately.
+
+Symbols traded by every bot
+----------------------------
+    EURUSD, GBPUSD, USDJPY, AUDUSD, USDCAD,
+    NZDUSD, EURJPY, GBPJPY, USDCHF, EURGBP
 
 Files produced per bot
 ----------------------
@@ -43,6 +49,27 @@ Create a ``.env`` file in the same directory with:
     # Optional – Telegram trade notifications
     TELEGRAM_TOKEN=123456789:AAxxxxxx...
     TELEGRAM_CHAT_ID=-1001234567890
+
+Ubuntu / tmux Quick-Start
+--------------------------
+    # 1. Install dependencies (once):
+    pip install oandapyV20 pandas numpy smartmoneyconcepts pytz python-dotenv
+
+    # 2. Create / edit your .env file with credentials.
+
+    # 3. Start a detached tmux session so the bots survive SSH disconnect:
+    tmux new-session -d -s smc 'python smc_bot_manager.py'
+
+    # 4. Attach to watch live output:
+    tmux attach -t smc
+
+    # 5. Detach without stopping (keep bots running):
+    Ctrl-b  d
+
+    # 6. Stop all bots:
+    tmux send-keys -t smc C-c
+    # or kill the session entirely:
+    tmux kill-session -t smc
 """
 
 from __future__ import annotations
@@ -141,18 +168,18 @@ _TF_MAP = {
 _BOT_DIR = Path(__file__).parent
 
 # ---------------------------------------------------------------------------
-# Bot configurations  (20 bots: bots 01-10 on M5, bots 11-20 on H1)
+# Bot configurations  (20 bots – each trades ALL 10 major pairs on M5)
 # ---------------------------------------------------------------------------
 
-BOT_CONFIGS: list[dict] = []
-for _i, _sym in enumerate(_MAJOR_PAIRS, start=1):
-    BOT_CONFIGS.append(
-        {"bot_id": _i, "magic": 1000 + _i, "symbol": _sym, "timeframe": "M5"}
-    )
-for _i, _sym in enumerate(_MAJOR_PAIRS, start=11):
-    BOT_CONFIGS.append(
-        {"bot_id": _i, "magic": 1000 + _i, "symbol": _sym, "timeframe": "H1"}
-    )
+BOT_CONFIGS: list[dict] = [
+    {
+        "bot_id": _i,
+        "magic": 1000 + _i,
+        "symbols": list(_MAJOR_PAIRS),
+        "timeframe": "M5",
+    }
+    for _i in range(1, 21)
+]
 
 
 # ---------------------------------------------------------------------------
@@ -610,11 +637,13 @@ def run_single_bot(config: dict) -> None:
     Parameters
     ----------
     config : dict
-        Keys: ``bot_id``, ``magic``, ``symbol``, ``timeframe``.
+        Keys: ``bot_id``, ``magic``, ``symbols``, ``timeframe``.
+        Each bot trades **all symbols** in the list simultaneously (multi-symbol
+        mode identical to ``live_bot.py``).
     """
     bot_id: int = config["bot_id"]
     magic: int = config["magic"]
-    symbol: str = config["symbol"]
+    symbols: list[str] = config["symbols"]
     timeframe: str = config["timeframe"]
     bot_label = f"Bot {bot_id:02d}"
 
@@ -663,14 +692,16 @@ def run_single_bot(config: dict) -> None:
         return
 
     daily_guard = DailyGuard()
-    last_bar_time: "pd.Timestamp | None" = None
+
+    # Per-symbol tracking of the last processed bar time
+    last_bar_times: dict[str, "pd.Timestamp | None"] = {sym: None for sym in symbols}
 
     logger.info(
-        "%s started – symbol=%s  tf=%s  magic=%d  env=%s",
-        bot_label, symbol, timeframe, magic, environment,
+        "%s started – symbols=%s  tf=%s  magic=%d  env=%s",
+        bot_label, ",".join(symbols), timeframe, magic, environment,
     )
     telegram(
-        f"🤖 {bot_label} ({symbol}) started – tf={timeframe} – magic={magic}"
+        f"🤖 {bot_label} started – {len(symbols)} pairs – tf={timeframe} – magic={magic}"
     )
 
     try:
@@ -698,126 +729,147 @@ def run_single_bot(config: dict) -> None:
                 time.sleep(_POLL_INTERVAL_SECONDS)
                 continue
 
-            # ── Spread filter ────────────────────────────────────────────
-            spread = _get_spread_pips(client, account_id, symbol, logger)
-            if spread >= _MAX_SPREAD_PIPS:
-                logger.debug("Spread %.3f pips too wide – skipping.", spread)
-                time.sleep(_POLL_INTERVAL_SECONDS)
-                continue
-
-            # ── Fetch OHLCV ──────────────────────────────────────────────
-            df = _fetch_ohlcv(client, symbol, granularity, _BARS_NEEDED, logger)
-            if df is None or len(df) < 50:
-                time.sleep(_POLL_INTERVAL_SECONDS)
-                continue
-
-            # ── New-bar guard ────────────────────────────────────────────
-            current_bar_time = df.index[-1]
-            if current_bar_time == last_bar_time:
-                time.sleep(_POLL_INTERVAL_SECONDS)
-                continue
-            last_bar_time = current_bar_time
-
-            # ── Generate SMC signals ─────────────────────────────────────
-            balance = _get_balance(client, account_id, logger)
-            try:
-                sig_df = generate_signals(
-                    df,
-                    risk_percent=_RISK_PERCENT,
-                    account_balance=balance,
-                    min_rr=_MIN_RR,
+            # ── Max open trades guard (per bot, counted from CSV) ────────
+            open_count = len(_get_open_trade_ids(bot_id))
+            if open_count >= _MAX_OPEN_TRADES:
+                logger.info(
+                    "Max open trades (%d) reached – skipping cycle.", open_count
                 )
-            except Exception as exc:  # noqa: BLE001
-                logger.error("generate_signals error: %s", exc)
                 time.sleep(_POLL_INTERVAL_SECONDS)
                 continue
 
-            # Evaluate only the last *closed* bar (index -2)
-            last_closed = sig_df.iloc[-2] if len(sig_df) >= 2 else sig_df.iloc[-1]
-            signal = int(last_closed["signal"])
+            # Fetch balance once per cycle; refreshed after each successful fill
+            balance = _get_balance(client, account_id, logger)
 
-            if signal == 0 or np.isnan(last_closed["entry"]):
-                logger.debug("No signal on latest closed bar.")
-                time.sleep(_POLL_INTERVAL_SECONDS)
-                continue
+            # ── Iterate over every symbol in one loop pass ───────────────
+            for symbol in symbols:
+                # Re-check open trades cap before each symbol so we don't
+                # exceed the limit if a previous symbol in this cycle filled it.
+                if open_count >= _MAX_OPEN_TRADES:
+                    logger.info(
+                        "[%s] Max open trades reached mid-cycle – stopping symbol loop.",
+                        symbol,
+                    )
+                    break
 
-            direction_str = "LONG" if signal == 1 else "SHORT"
-            entry = float(last_closed["entry"])
-            sl = float(last_closed["sl"])
-            tp = float(last_closed["tp"])
-            rr = float(last_closed["rr_ratio"])
-            lot = float(last_closed["lot_size"])
+                # Spread filter (per symbol)
+                spread = _get_spread_pips(client, account_id, symbol, logger)
+                if spread >= _MAX_SPREAD_PIPS:
+                    logger.debug(
+                        "[%s] Spread %.3f pips too wide – skipping.", symbol, spread
+                    )
+                    continue
 
-            if np.isnan(sl) or np.isnan(tp) or np.isnan(lot) or lot <= 0:
-                logger.warning("Invalid signal values; skipping.")
-                time.sleep(_POLL_INTERVAL_SECONDS)
-                continue
+                # Fetch OHLCV
+                df = _fetch_ohlcv(client, symbol, granularity, _BARS_NEEDED, logger)
+                if df is None or len(df) < 50:
+                    continue
 
-            logger.info(
-                "Signal: %s %s @ %.5f  sl=%.5f  tp=%.5f  RR=%.2f  lot=%.2f",
-                symbol, direction_str, entry, sl, tp, rr, lot,
-            )
+                # New-bar guard (per symbol)
+                current_bar_time = df.index[-1]
+                if current_bar_time == last_bar_times[symbol]:
+                    continue
+                last_bar_times[symbol] = current_bar_time
 
-            # ── Place the order ──────────────────────────────────────────
-            oanda_trade_id = _place_order(
-                client, account_id, symbol, signal, sl, tp, lot, magic, logger
-            )
+                try:
+                    sig_df = generate_signals(
+                        df,
+                        risk_percent=_RISK_PERCENT,
+                        account_balance=balance,
+                        min_rr=_MIN_RR,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    logger.error("[%s] generate_signals error: %s", symbol, exc)
+                    continue
 
-            if oanda_trade_id is None:
-                time.sleep(_POLL_INTERVAL_SECONDS)
-                continue
+                # Evaluate only the last *closed* bar (index -2;
+                # index -1 is the live candle still forming)
+                last_closed = sig_df.iloc[-2] if len(sig_df) >= 2 else sig_df.iloc[-1]
+                signal = int(last_closed["signal"])
 
-            # ── Record in CSV ────────────────────────────────────────────
-            ts_str = now_utc.strftime("%Y-%m-%d %H:%M:%S")
-            _append_trade(
-                bot_id,
-                {
-                    "timestamp": ts_str,
-                    "bot_id": bot_id,
-                    "magic": magic,
-                    "symbol": symbol,
-                    "timeframe": timeframe,
-                    "direction": direction_str,
-                    "entry": f"{entry:.5f}",
-                    "sl": f"{sl:.5f}",
-                    "tp": f"{tp:.5f}",
-                    "rr_ratio": f"{rr:.2f}",
-                    "lot_size": f"{lot:.2f}",
-                    "oanda_trade_id": oanda_trade_id,
-                    "status": "OPEN",
-                    "realized_pnl": "",
-                    "close_time": "",
-                },
-            )
+                if signal == 0 or np.isnan(last_closed["entry"]):
+                    logger.debug("[%s] No signal on latest closed bar.", symbol)
+                    continue
 
-            # ── Compute PnL figures for Telegram ─────────────────────────
-            total_pnl = _get_total_pnl(bot_id)
-            daily_pnl = _get_daily_pnl(bot_id)
-            pnl_sign = "+" if total_pnl >= 0 else ""
-            daily_sign = "+" if daily_pnl >= 0 else ""
+                direction_str = "LONG" if signal == 1 else "SHORT"
+                entry = float(last_closed["entry"])
+                sl = float(last_closed["sl"])
+                tp = float(last_closed["tp"])
+                rr = float(last_closed["rr_ratio"])
+                lot = float(last_closed["lot_size"])
 
-            # ── Telegram notification ────────────────────────────────────
-            tg_msg = (
-                f"<b>{bot_label} ({symbol}) {direction_str} @ {entry:.5f}</b>\n"
-                f"RR {rr:.1f} | Magic {magic}\n"
-                f"SL: {sl:.5f} | TP: {tp:.5f}\n"
-                f"PnL: {pnl_sign}{total_pnl:.2f} USD | "
-                f"Daily PnL: {daily_sign}{daily_pnl:.2f} USD"
-            )
-            telegram(tg_msg)
+                if np.isnan(sl) or np.isnan(tp) or np.isnan(lot) or lot <= 0:
+                    logger.warning("[%s] Invalid signal values; skipping.", symbol)
+                    continue
 
-            logger.info(
-                "TRADE PLACED – %s  %s @ %.5f | RR %.2f | Magic %d | "
-                "trade_id=%s | PnL %.2f | Daily PnL %.2f",
-                symbol, direction_str, entry, rr, magic,
-                oanda_trade_id, total_pnl, daily_pnl,
-            )
+                logger.info(
+                    "[%s] Signal: %s @ %.5f  sl=%.5f  tp=%.5f  RR=%.2f  lot=%.2f",
+                    symbol, direction_str, entry, sl, tp, rr, lot,
+                )
+
+                # ── Place the order ──────────────────────────────────────
+                oanda_trade_id = _place_order(
+                    client, account_id, symbol, signal, sl, tp, lot, magic, logger
+                )
+
+                if oanda_trade_id is None:
+                    continue
+
+                # ── Record in CSV ────────────────────────────────────────
+                ts_str = now_utc.strftime("%Y-%m-%d %H:%M:%S")
+                _append_trade(
+                    bot_id,
+                    {
+                        "timestamp": ts_str,
+                        "bot_id": bot_id,
+                        "magic": magic,
+                        "symbol": symbol,
+                        "timeframe": timeframe,
+                        "direction": direction_str,
+                        "entry": f"{entry:.5f}",
+                        "sl": f"{sl:.5f}",
+                        "tp": f"{tp:.5f}",
+                        "rr_ratio": f"{rr:.2f}",
+                        "lot_size": f"{lot:.2f}",
+                        "oanda_trade_id": oanda_trade_id,
+                        "status": "OPEN",
+                        "realized_pnl": "",
+                        "close_time": "",
+                    },
+                )
+
+                # Refresh balance and open-count after successful fill
+                open_count += 1
+                balance = _get_balance(client, account_id, logger)
+
+                # ── Compute PnL figures for Telegram ─────────────────────
+                total_pnl = _get_total_pnl(bot_id)
+                daily_pnl = _get_daily_pnl(bot_id)
+                pnl_sign = "+" if total_pnl >= 0 else ""
+                daily_sign = "+" if daily_pnl >= 0 else ""
+
+                # ── Telegram notification (bot number + symbol) ──────────
+                tg_msg = (
+                    f"<b>{bot_label} ({symbol}) {direction_str} @ {entry:.5f}</b>\n"
+                    f"RR {rr:.1f} | Magic {magic}\n"
+                    f"SL: {sl:.5f} | TP: {tp:.5f}\n"
+                    f"PnL: {pnl_sign}{total_pnl:.2f} USD | "
+                    f"Daily PnL: {daily_sign}{daily_pnl:.2f} USD"
+                )
+                telegram(tg_msg)
+
+                logger.info(
+                    "TRADE PLACED – [%s] %s @ %.5f | RR %.2f | Magic %d | "
+                    "trade_id=%s | PnL %.2f | Daily PnL %.2f",
+                    symbol, direction_str, entry, rr, magic,
+                    oanda_trade_id, total_pnl, daily_pnl,
+                )
 
             time.sleep(_POLL_INTERVAL_SECONDS)
 
     except KeyboardInterrupt:
         logger.info("%s stopped by user.", bot_label)
-        telegram(f"🛑 {bot_label} ({symbol}) stopped.")
+        telegram(f"🛑 {bot_label} stopped.")
 
 
 # ---------------------------------------------------------------------------
@@ -843,7 +895,7 @@ def main(bot_ids: list[int] | None = None) -> None:
     print(f"Starting {len(configs)} bot(s) …")
     for cfg in configs:
         print(
-            f"  Bot {cfg['bot_id']:02d}  symbol={cfg['symbol']:<8}  "
+            f"  Bot {cfg['bot_id']:02d}  symbols={len(cfg['symbols'])} pairs  "
             f"tf={cfg['timeframe']:<4}  magic={cfg['magic']}"
         )
 
@@ -906,12 +958,13 @@ if __name__ == "__main__":
     args = _parse_args()
 
     if args.list_bots:
-        print(f"{'ID':>4}  {'Magic':>6}  {'Symbol':<8}  TF")
-        print("-" * 30)
+        pairs_str = ",".join(_MAJOR_PAIRS)
+        print(f"{'ID':>4}  {'Magic':>6}  {'Symbols':<62}  TF")
+        print("-" * 82)
         for cfg in BOT_CONFIGS:
             print(
                 f"{cfg['bot_id']:>4}  {cfg['magic']:>6}  "
-                f"{cfg['symbol']:<8}  {cfg['timeframe']}"
+                f"{pairs_str:<62}  {cfg['timeframe']}"
             )
     else:
         selected_ids: list[int] | None = None
