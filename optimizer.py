@@ -11,19 +11,19 @@ Walk-Forward Validation
 
 Transaction Costs (fixed, no slippage parameter)
 -------------------------------------------------
-  1.0 pip round-trip per trade (0.5 pip entry + 0.5 pip exit) is
+  0.5 pip round-trip per trade (realistic OANDA-level cost) is
   deducted from every trade's PnL in units of risk-percent:
 
       cost = (ROUND_TRIP_PIPS * pip_size / sl_distance) * risk_percent
 
 Parameter Grid
 --------------
-  session_start_hour : [5, 6, 7, 8, 9]
-  session_end_hour   : [16, 17, 18, 19, 20, 21]
-  max_spread_pips    : [0.8, 1.2, 1.5, 1.8, 2.2, 2.5, 3.0, 4.0]
-  min_rr             : [1.5, 2.0, 3.0, 4.0, 5.0]
-  lookback           : [5, 8, 12, 15, 20, 25, 30]
-  risk_percent       : [0.5, 1.0, 2.0, 3.0]
+  session_start_hour : [6, 7, 8, 9]
+  session_end_hour   : [17, 18, 19]
+  max_spread_pips    : [1.5, 1.8, 2.0, 2.2, 2.5, 3.0]
+  min_rr             : [1.8, 2.0, 2.2, 2.5, 3.0, 4.0, 5.0]
+  lookback           : [10, 12, 15, 18, 20, 22, 25, 30]
+  risk_percent       : [0.5, 1.0, 2.0]
 
 Outputs
 -------
@@ -58,17 +58,19 @@ TRAIN_END   = "2023-12-31"
 TEST_START  = "2024-01-01"
 TEST_END    = "2025-12-31"
 
-ROUND_TRIP_PIPS = 1.0       # Fixed 1.0 pip round-trip cost (0.5 entry + 0.5 exit)
+ROUND_TRIP_PIPS = 0.5       # Total round-trip cost per trade (realistic OANDA-level: ~0.5 pip spread)
 NUM_WORKERS     = 10        # Max parallel workers
+MAX_DD_FILTER   = 10.0      # Only combinations with test_max_dd <= this value shown in top 20
+MAX_RISK_FILTER =  2.0      # Only combinations with risk_percent <= this value shown in top 20
 MAX_LOOKFORWARD = 1000      # Max M5 bars to scan forward for SL/TP (~3.5 days)
 
 PARAM_GRID: dict[str, list] = {
-    "session_start_hour": [5, 6, 7, 8, 9],
-    "session_end_hour":   [16, 17, 18, 19, 20, 21],
-    "max_spread_pips":    [0.8, 1.2, 1.5, 1.8, 2.2, 2.5, 3.0, 4.0],
-    "min_rr":             [1.5, 2.0, 3.0, 4.0, 5.0],
-    "lookback":           [5, 8, 12, 15, 20, 25, 30],
-    "risk_percent":       [0.5, 1.0, 2.0, 3.0],
+    "session_start_hour": [6, 7, 8, 9],
+    "session_end_hour":   [17, 18, 19],
+    "max_spread_pips":    [1.5, 1.8, 2.0, 2.2, 2.5, 3.0],
+    "min_rr":             [1.8, 2.0, 2.2, 2.5, 3.0, 4.0, 5.0],
+    "lookback":           [10, 12, 15, 18, 20, 22, 25, 30],
+    "risk_percent":       [0.5, 1.0, 2.0],
 }
 
 _PARAM_KEYS = list(PARAM_GRID.keys())
@@ -263,7 +265,7 @@ def _precompute_pair(df_m5: pd.DataFrame, pair_name: str) -> dict:
 def _simulate_pair(pdata: dict, params: dict) -> dict:
     """Simulate trades for one pair with the given parameter combination.
 
-    1.0 pip round-trip cost (0.5 pip entry + 0.5 pip exit) is deducted
+    0.5 pip round-trip cost (realistic OANDA-level) is deducted
     from every trade's PnL in units of risk-percent.
     """
     if not pdata:
@@ -374,7 +376,7 @@ def _simulate_pair(pdata: dict, params: dict) -> dict:
             rr       = float(rr_short[sig_i])
             sl_dist  = float(sl_dist_short[sig_i])
 
-        # 1.0 pip round-trip cost (0.5 entry + 0.5 exit) in risk-percent units
+        # 0.5 pip round-trip cost (realistic OANDA-level) in risk-percent units
         cost = (ROUND_TRIP_PIPS * pip_size / sl_dist) * risk_percent
 
         # Bounded forward search for first SL / TP hit
@@ -672,9 +674,12 @@ def run_optimization() -> pd.DataFrame:
     print(f"\n[4/4] All {len(results_df):,} results saved to: {results_path}")
 
     # ------------------------------------------------------------------
-    # 6. Top 20 by Net Profit
+    # 6. Top 20 by Net Profit (filtered: test_max_dd <= 10.0, risk_percent <= 2.0)
     # ------------------------------------------------------------------
-    top20 = results_df.head(20).copy()
+    filtered_df = results_df[
+        (results_df["test_max_dd"] <= MAX_DD_FILTER) & (results_df["risk_percent"] <= MAX_RISK_FILTER)
+    ]
+    top20 = filtered_df.head(20).copy()
     top20.insert(0, "rank", range(1, len(top20) + 1))
 
     # Build display-friendly table

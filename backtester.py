@@ -11,9 +11,10 @@ def get_pip_size(pair_name: str) -> float:
     """Return pip size: 0.01 for JPY pairs, 0.0001 for all others.
 
     Used by both the backtester and the optimizer.  For the optimizer a
-    fixed **1.0 pip round-trip** transaction cost is applied per trade via::
+    fixed **0.5 pip round-trip** transaction cost (realistic OANDA-level)
+    is applied per trade via::
 
-        cost_pct = (1.0 * pip_size / sl_distance) * risk_percent
+        cost_pct = (0.5 * pip_size / sl_distance) * risk_percent
 
     Pair names follow data_loader's format: ``XXXYYY_YEAR``
     (e.g. ``USDJPY_2023``).  ``split("_")[0]`` yields the full 6-character
@@ -23,6 +24,9 @@ def get_pip_size(pair_name: str) -> float:
     The current ``backtest_pair`` function does *not* apply explicit pip
     costs so that existing backtest behaviour is preserved.  Use
     ``optimizer.py`` for cost-aware walk-forward analysis.
+
+    ``ROUND_TRIP_PIPS`` defines the realistic transaction cost used when
+    the backtester is extended to apply spread/commission deductions.
     """
     base = pair_name.split("_")[0].upper()
     return 0.01 if base.endswith("JPY") else 0.0001
@@ -42,6 +46,9 @@ _TRADES_LOG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tra
 
 _REASON_LONG = "Bull FVG + Bull BOS + Liq Sweep Below + Discount Zone"
 _REASON_SHORT = "Bear FVG + Bear BOS + Liq Sweep Above + Premium Zone"
+
+# Realistic round-trip transaction cost (OANDA-level: 0.5 pip total per trade)
+ROUND_TRIP_PIPS = 0.5
 
 # Fixed risk per trade in account percentage (like a real trader risking 1% per trade)
 _RISK_PERCENT = 1.0
