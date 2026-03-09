@@ -1,0 +1,922 @@
+"""smc_bot_manager.py – Manager for 20 SMC bots on a single OANDA Demo account.
+
+Overview
+--------
+Each of the 20 bots is identified by a unique **Magic Number** (1001–1020)
+that is embedded in the OANDA order's ``clientExtensions.id``.  All 20 bots
+run in parallel via :mod:`multiprocessing`.
+
+Bot configuration
+-----------------
+* Bots 01–10 : 10 major FX pairs on M5
+* Bots 11–20 : same 10 pairs on H1
+
+Files produced per bot
+----------------------
+* ``bot_01.log``         … ``bot_20.log``          (structured text log)
+* ``trades_bot_01.csv``  … ``trades_bot_20.csv``   (every trade with full details)
+
+Telegram format (on every filled trade)
+----------------------------------------
+    Bot 07 (EURUSD) LONG @ 1.0854 | RR 3.8 | Magic 1007
+    PnL: +12.34 USD | Daily PnL: +34.56 USD
+
+Usage
+-----
+    # Start all 20 bots:
+    python smc_bot_manager.py
+
+    # Start only a subset of bots by id:
+    python smc_bot_manager.py --bot-ids 1,3,7
+
+    # List available bot configurations and exit:
+    python smc_bot_manager.py --list-bots
+
+.env Setup
+----------
+Create a ``.env`` file in the same directory with:
+
+    ACCOUNT_ID=101-001-12345678-001
+    ACCESS_TOKEN=xxxxxxxx-xxxx...
+    ENVIRONMENT=practice          # practice or live (default: practice)
+
+    # Optional – Telegram trade notifications
+    TELEGRAM_TOKEN=123456789:AAxxxxxx...
+    TELEGRAM_CHAT_ID=-1001234567890
+"""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import logging
+import multiprocessing
+import os
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+
+# ---------------------------------------------------------------------------
+# Load .env file (python-dotenv optional – built-in fallback parser)
+# ---------------------------------------------------------------------------
+
+def _load_dotenv(path: str = ".env") -> None:
+    """Parse a simple KEY=VALUE .env file and populate missing env vars."""
+    resolved = Path(path)
+    if not resolved.is_absolute():
+        resolved = Path(__file__).parent / path
+    if not resolved.is_file():
+        return
+    with resolved.open(encoding="utf-8") as fh:
+        for raw_line in fh:
+            line = raw_line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, _, value = line.partition("=")
+            key = key.strip()
+            value = value.strip().strip('"').strip("'")
+            if key and key not in os.environ:
+                os.environ[key] = value
+
+
+try:
+    from dotenv import load_dotenv as _dotenv_load  # type: ignore
+    _dotenv_load(dotenv_path=Path(__file__).parent / ".env")
+except ImportError:
+    _load_dotenv()
+
+# ---------------------------------------------------------------------------
+# Optional imports – graceful fallback so the module can be imported/tested
+# without oandapyV20 installed.
+# ---------------------------------------------------------------------------
+try:
+    from oandapyV20 import API as _OandaAPI  # type: ignore
+    import oandapyV20.endpoints.accounts as _ep_accounts  # type: ignore
+    import oandapyV20.endpoints.instruments as _ep_instruments  # type: ignore
+    import oandapyV20.endpoints.orders as _ep_orders  # type: ignore
+    import oandapyV20.endpoints.pricing as _ep_pricing  # type: ignore
+    import oandapyV20.endpoints.trades as _ep_trades  # type: ignore
+    _OANDA_AVAILABLE = True
+except ImportError:  # pragma: no cover
+    _OandaAPI = None  # type: ignore
+    _ep_accounts = _ep_instruments = _ep_orders = _ep_pricing = _ep_trades = None
+    _OANDA_AVAILABLE = False
+
+try:
+    import pytz  # type: ignore
+    _LONDON_TZ = pytz.timezone("Europe/London")
+except ImportError:  # pragma: no cover
+    _LONDON_TZ = None  # type: ignore
+
+from smc_strategy import generate_signals
+
+# ---------------------------------------------------------------------------
+# Global constants (mirrors live_bot.py defaults)
+# ---------------------------------------------------------------------------
+_SESSION_START_HOUR = 8    # 08:00 London time
+_SESSION_END_HOUR = 17     # 17:00 London time (exclusive)
+_MAX_SPREAD_PIPS = 1.8
+_RISK_PERCENT = 1.0        # % of account balance risked per trade
+_MIN_RR = 2.0
+_MAX_DAILY_LOSS_PCT = 3.0  # % of start-of-day equity
+_POLL_INTERVAL_SECONDS = 60
+_BARS_NEEDED = 200
+
+_MAJOR_PAIRS = [
+    "EURUSD", "GBPUSD", "USDJPY", "AUDUSD", "USDCAD",
+    "NZDUSD", "EURJPY", "GBPJPY", "USDCHF", "EURGBP",
+]
+
+# OANDA granularity map
+_TF_MAP = {
+    "M1": "M1", "M5": "M5", "M15": "M15",
+    "M30": "M30", "H1": "H1", "H4": "H4",
+    "D1": "D",
+}
+
+# Base directory – same folder as this script
+_BOT_DIR = Path(__file__).parent
+
+# ---------------------------------------------------------------------------
+# Bot configurations  (20 bots: bots 01-10 on M5, bots 11-20 on H1)
+# ---------------------------------------------------------------------------
+
+BOT_CONFIGS: list[dict] = []
+for _i, _sym in enumerate(_MAJOR_PAIRS, start=1):
+    BOT_CONFIGS.append(
+        {"bot_id": _i, "magic": 1000 + _i, "symbol": _sym, "timeframe": "M5"}
+    )
+for _i, _sym in enumerate(_MAJOR_PAIRS, start=11):
+    BOT_CONFIGS.append(
+        {"bot_id": _i, "magic": 1000 + _i, "symbol": _sym, "timeframe": "H1"}
+    )
+
+
+# ---------------------------------------------------------------------------
+# CSV helpers
+# ---------------------------------------------------------------------------
+
+_TRADE_CSV_COLUMNS = [
+    "timestamp",
+    "bot_id",
+    "magic",
+    "symbol",
+    "timeframe",
+    "direction",
+    "entry",
+    "sl",
+    "tp",
+    "rr_ratio",
+    "lot_size",
+    "oanda_trade_id",
+    "status",           # OPEN | CLOSED | CANCELLED
+    "realized_pnl",
+    "close_time",
+]
+
+
+def _csv_path(bot_id: int) -> Path:
+    return _BOT_DIR / f"trades_bot_{bot_id:02d}.csv"
+
+
+def _ensure_csv(bot_id: int) -> None:
+    """Create the trades CSV with a header row if it does not exist yet."""
+    path = _csv_path(bot_id)
+    if not path.exists():
+        with path.open("w", newline="", encoding="utf-8") as fh:
+            writer = csv.DictWriter(fh, fieldnames=_TRADE_CSV_COLUMNS)
+            writer.writeheader()
+
+
+def _append_trade(bot_id: int, row: dict) -> None:
+    """Append a trade row to this bot's CSV file."""
+    path = _csv_path(bot_id)
+    with path.open("a", newline="", encoding="utf-8") as fh:
+        writer = csv.DictWriter(fh, fieldnames=_TRADE_CSV_COLUMNS)
+        writer.writerow(row)
+
+
+def _update_trade_pnl(
+    bot_id: int,
+    oanda_trade_id: str,
+    realized_pnl: float,
+    close_time: str,
+) -> None:
+    """Update the realized_pnl + close_time for a specific OANDA trade ID."""
+    path = _csv_path(bot_id)
+    if not path.exists():
+        return
+    rows: list[dict] = []
+    with path.open("r", newline="", encoding="utf-8") as fh:
+        reader = csv.DictReader(fh)
+        for r in reader:
+            if r["oanda_trade_id"] == oanda_trade_id and r["status"] == "OPEN":
+                r["realized_pnl"] = f"{realized_pnl:.2f}"
+                r["close_time"] = close_time
+                r["status"] = "CLOSED"
+            rows.append(r)
+    with path.open("w", newline="", encoding="utf-8") as fh:
+        writer = csv.DictWriter(fh, fieldnames=_TRADE_CSV_COLUMNS)
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def _get_open_trade_ids(bot_id: int) -> list[str]:
+    """Return OANDA trade IDs that still have status=OPEN in the CSV."""
+    path = _csv_path(bot_id)
+    if not path.exists():
+        return []
+    ids: list[str] = []
+    with path.open("r", newline="", encoding="utf-8") as fh:
+        reader = csv.DictReader(fh)
+        for r in reader:
+            if r.get("status") == "OPEN" and r.get("oanda_trade_id"):
+                ids.append(r["oanda_trade_id"])
+    return ids
+
+
+def _get_daily_pnl(bot_id: int) -> float:
+    """Sum of realized_pnl for all trades closed today for this bot."""
+    path = _csv_path(bot_id)
+    if not path.exists():
+        return 0.0
+    today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    total = 0.0
+    with path.open("r", newline="", encoding="utf-8") as fh:
+        reader = csv.DictReader(fh)
+        for r in reader:
+            if r.get("status") == "CLOSED" and r.get("close_time", "").startswith(today_str):
+                try:
+                    total += float(r["realized_pnl"])
+                except (ValueError, KeyError):
+                    pass
+    return total
+
+
+def _get_total_pnl(bot_id: int) -> float:
+    """Sum of all realized_pnl entries for this bot."""
+    path = _csv_path(bot_id)
+    if not path.exists():
+        return 0.0
+    total = 0.0
+    with path.open("r", newline="", encoding="utf-8") as fh:
+        reader = csv.DictReader(fh)
+        for r in reader:
+            if r.get("status") == "CLOSED":
+                try:
+                    total += float(r["realized_pnl"])
+                except (ValueError, KeyError):
+                    pass
+    return total
+
+
+# ---------------------------------------------------------------------------
+# Logging setup (per-bot)
+# ---------------------------------------------------------------------------
+
+def _make_logger(bot_id: int) -> logging.Logger:
+    """Return a Logger that writes to bot_XX.log."""
+    name = f"smc_bot_{bot_id:02d}"
+    logger = logging.getLogger(name)
+    if logger.handlers:
+        return logger  # already configured (e.g. after fork on macOS)
+    logger.setLevel(logging.DEBUG)
+    log_path = _BOT_DIR / f"bot_{bot_id:02d}.log"
+    fh = logging.FileHandler(log_path, encoding="utf-8")
+    fh.setLevel(logging.DEBUG)
+    fh.setFormatter(
+        logging.Formatter(
+            f"%(asctime)s  [Bot {bot_id:02d}]  %(levelname)-5s  %(message)s",
+            datefmt="%Y-%m-%d %H:%M:%S",
+        )
+    )
+    logger.addHandler(fh)
+    return logger
+
+
+# ---------------------------------------------------------------------------
+# Telegram helper
+# ---------------------------------------------------------------------------
+
+def _send_telegram(message: str, token: str, chat_id: str, logger: logging.Logger) -> None:
+    """Send *message* via Telegram if credentials are configured."""
+    if not (token and chat_id):
+        return
+    try:
+        import json as _json
+        import urllib.request
+
+        payload = _json.dumps(
+            {"chat_id": chat_id, "text": message, "parse_mode": "HTML"}
+        ).encode()
+        req = urllib.request.Request(
+            f"https://api.telegram.org/bot{token}/sendMessage",
+            data=payload,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            if resp.status != 200:
+                logger.warning("Telegram delivery failed: HTTP %s", resp.status)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Telegram error: %s", exc)
+
+
+# ---------------------------------------------------------------------------
+# Session filter (shared with live_bot)
+# ---------------------------------------------------------------------------
+
+def _in_session(dt_utc: datetime) -> bool:
+    """Return True when *dt_utc* falls within 08:00–17:00 London time."""
+    if _LONDON_TZ is None:
+        london_hour = dt_utc.hour
+    else:
+        london_dt = dt_utc.astimezone(_LONDON_TZ)
+        london_hour = london_dt.hour
+    return _SESSION_START_HOUR <= london_hour < _SESSION_END_HOUR
+
+
+# ---------------------------------------------------------------------------
+# Symbol helpers (shared with live_bot)
+# ---------------------------------------------------------------------------
+
+def _to_oanda_symbol(symbol: str) -> str:
+    s = symbol.upper().replace("_", "")
+    if len(s) == 6:
+        return f"{s[:3]}_{s[3:]}"
+    return s
+
+
+def _pip_size(symbol: str) -> float:
+    s = symbol.upper().replace("_", "")
+    return 0.01 if "JPY" in s else 0.0001
+
+
+# ---------------------------------------------------------------------------
+# OANDA API helpers
+# ---------------------------------------------------------------------------
+
+def _oanda_init(
+    account_id: str,
+    access_token: str,
+    environment: str,
+    logger: logging.Logger,
+) -> "_OandaAPI | None":
+    if not _OANDA_AVAILABLE:
+        logger.error("oandapyV20 not installed.  Run: pip install oandapyV20")
+        return None
+    client = _OandaAPI(access_token=access_token, environment=environment)
+    try:
+        r = _ep_accounts.AccountSummary(accountID=account_id)
+        client.request(r)
+        acct = r.response["account"]
+        logger.info(
+            "OANDA connected – account=%s  balance=%s  currency=%s  env=%s",
+            acct.get("id", account_id),
+            acct.get("balance", "?"),
+            acct.get("currency", "?"),
+            environment,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.error("OANDA connection failed: %s", exc)
+        return None
+    return client
+
+
+def _get_account_summary(
+    client: "_OandaAPI", account_id: str, logger: logging.Logger
+) -> dict:
+    try:
+        r = _ep_accounts.AccountSummary(accountID=account_id)
+        client.request(r)
+        return r.response.get("account", {})
+    except Exception as exc:  # noqa: BLE001
+        logger.error("AccountSummary error: %s", exc)
+        return {}
+
+
+def _get_equity(client: "_OandaAPI", account_id: str, logger: logging.Logger) -> float:
+    acct = _get_account_summary(client, account_id, logger)
+    return float(acct.get("NAV", acct.get("balance", 0.0)))
+
+
+def _get_balance(client: "_OandaAPI", account_id: str, logger: logging.Logger) -> float:
+    acct = _get_account_summary(client, account_id, logger)
+    return float(acct.get("balance", 0.0))
+
+
+def _get_spread_pips(
+    client: "_OandaAPI",
+    account_id: str,
+    symbol: str,
+    logger: logging.Logger,
+) -> float:
+    oanda_sym = _to_oanda_symbol(symbol)
+    try:
+        r = _ep_pricing.PricingInfo(
+            accountID=account_id, params={"instruments": oanda_sym}
+        )
+        client.request(r)
+        prices = r.response.get("prices", [])
+        if not prices:
+            return float("inf")
+        price_data = prices[0]
+        bids = price_data.get("bids", [])
+        asks = price_data.get("asks", [])
+        if not bids or not asks:
+            return float("inf")
+        bid = float(bids[0]["price"])
+        ask = float(asks[0]["price"])
+        spread = ask - bid
+        pip = _pip_size(symbol)
+        return spread / pip if pip > 0 else float("inf")
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("PricingInfo error: %s", exc)
+        return float("inf")
+
+
+def _fetch_ohlcv(
+    client: "_OandaAPI",
+    symbol: str,
+    granularity: str,
+    n_bars: int,
+    logger: logging.Logger,
+) -> "pd.DataFrame | None":
+    oanda_sym = _to_oanda_symbol(symbol)
+    try:
+        r = _ep_instruments.InstrumentsCandles(
+            instrument=oanda_sym,
+            params={"count": n_bars, "granularity": granularity, "price": "M"},
+        )
+        client.request(r)
+        candles = r.response.get("candles", [])
+        if not candles:
+            logger.warning("No candles returned for %s", symbol)
+            return None
+        rows = []
+        for c in candles:
+            mid = c.get("mid", {})
+            rows.append(
+                {
+                    "time": c["time"],
+                    "open": float(mid["o"]),
+                    "high": float(mid["h"]),
+                    "low": float(mid["l"]),
+                    "close": float(mid["c"]),
+                    "volume": float(c.get("volume", 0)),
+                }
+            )
+        df = pd.DataFrame(rows)
+        df["time"] = pd.to_datetime(df["time"], utc=True)
+        df.set_index("time", inplace=True)
+        return df
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("InstrumentsCandles error: %s", exc)
+        return None
+
+
+def _place_order(
+    client: "_OandaAPI",
+    account_id: str,
+    symbol: str,
+    direction: int,
+    sl: float,
+    tp: float,
+    units: float,
+    magic: int,
+    logger: logging.Logger,
+) -> "str | None":
+    """Send a market order to OANDA with attached SL, TP, and clientExtensions.
+
+    Returns the OANDA trade ID on success, ``None`` on failure.
+    """
+    oanda_sym = _to_oanda_symbol(symbol)
+    pip = _pip_size(symbol)
+    price_decimals = 3 if pip == 0.01 else 5
+
+    signed_units = int(round(abs(units))) * direction
+    if signed_units == 0:
+        logger.error("Calculated units = 0 for %s; skipping order.", symbol)
+        return None
+
+    # clientExtensions.id encodes the magic number so trades can be filtered
+    # per bot.  The id must be 1–128 alphanumeric / hyphen / underscore chars.
+    client_ext_id = f"magic_{magic}"
+
+    data = {
+        "order": {
+            "type": "MARKET",
+            "instrument": oanda_sym,
+            "units": str(signed_units),
+            "stopLossOnFill": {
+                "price": f"{sl:.{price_decimals}f}",
+                "timeInForce": "GTC",
+            },
+            "takeProfitOnFill": {
+                "price": f"{tp:.{price_decimals}f}",
+                "timeInForce": "GTC",
+            },
+            "tradeClientExtensions": {
+                "id": client_ext_id,
+                "tag": f"bot_{magic}",
+                "comment": f"SMC Bot magic={magic}",
+            },
+        }
+    }
+
+    try:
+        r = _ep_orders.Orders(accountID=account_id, data=data)
+        client.request(r)
+        resp = r.response
+        if "orderRejectTransaction" in resp:
+            reason = resp["orderRejectTransaction"].get("rejectReason", "unknown")
+            logger.error("Order rejected by OANDA: %s", reason)
+            return None
+        if "orderFillTransaction" not in resp:
+            logger.error("Order response had no fill transaction: %s", resp)
+            return None
+        trade_id = resp["orderFillTransaction"].get("tradeOpened", {}).get("tradeID")
+        if not trade_id:
+            # Fallback: try the first tradeID from relatedTransactionIDs
+            related = resp.get("relatedTransactionIDs", [])
+            trade_id = str(related[0]) if related else ""
+        return str(trade_id) if trade_id else None
+    except Exception as exc:  # noqa: BLE001
+        logger.error("Order placement failed: %s", exc)
+        return None
+
+
+def _check_closed_trades(
+    client: "_OandaAPI",
+    account_id: str,
+    bot_id: int,
+    logger: logging.Logger,
+) -> None:
+    """Check open trades recorded in the CSV and update PnL for those closed."""
+    open_ids = _get_open_trade_ids(bot_id)
+    if not open_ids:
+        return
+    for trade_id in open_ids:
+        try:
+            r = _ep_trades.TradeDetails(accountID=account_id, tradeID=trade_id)
+            client.request(r)
+            trade_data = r.response.get("trade", {})
+            state = trade_data.get("state", "OPEN")
+            if state in ("CLOSED", "CLOSE_WHEN_TRADABLE"):
+                realized_pnl = float(trade_data.get("realizedPL", 0.0))
+                close_time = trade_data.get("closeTime", datetime.now(timezone.utc).isoformat())
+                _update_trade_pnl(bot_id, trade_id, realized_pnl, close_time)
+                logger.info(
+                    "Trade %s CLOSED  realizedPL=%.2f", trade_id, realized_pnl
+                )
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("Could not check trade %s: %s", trade_id, exc)
+
+
+# ---------------------------------------------------------------------------
+# Daily loss guard (per-bot equity tracking)
+# ---------------------------------------------------------------------------
+
+class DailyGuard:
+    """Track start-of-day equity and enforce the max daily loss limit."""
+
+    def __init__(self, max_loss_pct: float = _MAX_DAILY_LOSS_PCT) -> None:
+        self.max_loss_pct = max_loss_pct
+        self._day: int | None = None
+        self._start_equity: float = 0.0
+
+    def update(self, equity: float, today_int: int) -> None:
+        if self._day != today_int:
+            self._day = today_int
+            self._start_equity = equity
+
+    def is_limit_hit(self, equity: float) -> bool:
+        if self._start_equity <= 0:
+            return False
+        loss_pct = (self._start_equity - equity) / self._start_equity * 100.0
+        return loss_pct >= self.max_loss_pct
+
+
+# ---------------------------------------------------------------------------
+# Single-bot worker (runs in its own process)
+# ---------------------------------------------------------------------------
+
+def run_single_bot(config: dict) -> None:
+    """Entry point for one bot process.
+
+    Parameters
+    ----------
+    config : dict
+        Keys: ``bot_id``, ``magic``, ``symbol``, ``timeframe``.
+    """
+    bot_id: int = config["bot_id"]
+    magic: int = config["magic"]
+    symbol: str = config["symbol"]
+    timeframe: str = config["timeframe"]
+    bot_label = f"Bot {bot_id:02d}"
+
+    # Set up per-bot logger
+    logger = _make_logger(bot_id)
+
+    # Each child process must re-read env vars (needed after os.fork on Unix)
+    try:
+        from dotenv import load_dotenv as _dl  # type: ignore
+        _dl(dotenv_path=Path(__file__).parent / ".env", override=False)
+    except ImportError:
+        _load_dotenv()
+
+    account_id = os.getenv("ACCOUNT_ID", "").strip()
+    access_token = os.getenv("ACCESS_TOKEN", "").strip()
+    environment = os.getenv("ENVIRONMENT", "practice").strip().lower()
+    tg_token = os.getenv("TELEGRAM_TOKEN", "").strip()
+    tg_chat_id = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+
+    def telegram(msg: str) -> None:
+        _send_telegram(msg, tg_token, tg_chat_id, logger)
+
+    if not account_id or not access_token:
+        logger.error(
+            "ACCOUNT_ID and ACCESS_TOKEN must be set in the .env file."
+        )
+        return
+
+    if environment not in ("practice", "live"):
+        logger.error(
+            "Invalid ENVIRONMENT value in .env: %r (must be 'practice' or 'live')",
+            environment,
+        )
+        return
+
+    # Ensure CSV exists
+    _ensure_csv(bot_id)
+
+    granularity = _TF_MAP.get(timeframe.upper())
+    if granularity is None:
+        logger.error("Unknown timeframe '%s'.", timeframe)
+        return
+
+    client = _oanda_init(account_id, access_token, environment, logger)
+    if client is None:
+        return
+
+    daily_guard = DailyGuard()
+    last_bar_time: "pd.Timestamp | None" = None
+
+    logger.info(
+        "%s started – symbol=%s  tf=%s  magic=%d  env=%s",
+        bot_label, symbol, timeframe, magic, environment,
+    )
+    telegram(
+        f"🤖 {bot_label} ({symbol}) started – tf={timeframe} – magic={magic}"
+    )
+
+    try:
+        while True:
+            now_utc = datetime.now(timezone.utc)
+            today_int = now_utc.date().toordinal()
+
+            equity = _get_equity(client, account_id, logger)
+            daily_guard.update(equity, today_int)
+
+            # ── Update PnL for any trades that closed since last cycle ───
+            _check_closed_trades(client, account_id, bot_id, logger)
+
+            # ── Daily loss guard ─────────────────────────────────────────
+            if daily_guard.is_limit_hit(equity):
+                logger.warning(
+                    "Daily loss limit (%.1f%%) reached – pausing until next day.",
+                    _MAX_DAILY_LOSS_PCT,
+                )
+                time.sleep(_POLL_INTERVAL_SECONDS)
+                continue
+
+            # ── Session filter ───────────────────────────────────────────
+            if not _in_session(now_utc):
+                time.sleep(_POLL_INTERVAL_SECONDS)
+                continue
+
+            # ── Spread filter ────────────────────────────────────────────
+            spread = _get_spread_pips(client, account_id, symbol, logger)
+            if spread >= _MAX_SPREAD_PIPS:
+                logger.debug("Spread %.3f pips too wide – skipping.", spread)
+                time.sleep(_POLL_INTERVAL_SECONDS)
+                continue
+
+            # ── Fetch OHLCV ──────────────────────────────────────────────
+            df = _fetch_ohlcv(client, symbol, granularity, _BARS_NEEDED, logger)
+            if df is None or len(df) < 50:
+                time.sleep(_POLL_INTERVAL_SECONDS)
+                continue
+
+            # ── New-bar guard ────────────────────────────────────────────
+            current_bar_time = df.index[-1]
+            if current_bar_time == last_bar_time:
+                time.sleep(_POLL_INTERVAL_SECONDS)
+                continue
+            last_bar_time = current_bar_time
+
+            # ── Generate SMC signals ─────────────────────────────────────
+            balance = _get_balance(client, account_id, logger)
+            try:
+                sig_df = generate_signals(
+                    df,
+                    risk_percent=_RISK_PERCENT,
+                    account_balance=balance,
+                    min_rr=_MIN_RR,
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.error("generate_signals error: %s", exc)
+                time.sleep(_POLL_INTERVAL_SECONDS)
+                continue
+
+            # Evaluate only the last *closed* bar (index -2)
+            last_closed = sig_df.iloc[-2] if len(sig_df) >= 2 else sig_df.iloc[-1]
+            signal = int(last_closed["signal"])
+
+            if signal == 0 or np.isnan(last_closed["entry"]):
+                logger.debug("No signal on latest closed bar.")
+                time.sleep(_POLL_INTERVAL_SECONDS)
+                continue
+
+            direction_str = "LONG" if signal == 1 else "SHORT"
+            entry = float(last_closed["entry"])
+            sl = float(last_closed["sl"])
+            tp = float(last_closed["tp"])
+            rr = float(last_closed["rr_ratio"])
+            lot = float(last_closed["lot_size"])
+
+            if np.isnan(sl) or np.isnan(tp) or np.isnan(lot) or lot <= 0:
+                logger.warning("Invalid signal values; skipping.")
+                time.sleep(_POLL_INTERVAL_SECONDS)
+                continue
+
+            logger.info(
+                "Signal: %s %s @ %.5f  sl=%.5f  tp=%.5f  RR=%.2f  lot=%.2f",
+                symbol, direction_str, entry, sl, tp, rr, lot,
+            )
+
+            # ── Place the order ──────────────────────────────────────────
+            oanda_trade_id = _place_order(
+                client, account_id, symbol, signal, sl, tp, lot, magic, logger
+            )
+
+            if oanda_trade_id is None:
+                time.sleep(_POLL_INTERVAL_SECONDS)
+                continue
+
+            # ── Record in CSV ────────────────────────────────────────────
+            ts_str = now_utc.strftime("%Y-%m-%d %H:%M:%S")
+            _append_trade(
+                bot_id,
+                {
+                    "timestamp": ts_str,
+                    "bot_id": bot_id,
+                    "magic": magic,
+                    "symbol": symbol,
+                    "timeframe": timeframe,
+                    "direction": direction_str,
+                    "entry": f"{entry:.5f}",
+                    "sl": f"{sl:.5f}",
+                    "tp": f"{tp:.5f}",
+                    "rr_ratio": f"{rr:.2f}",
+                    "lot_size": f"{lot:.2f}",
+                    "oanda_trade_id": oanda_trade_id,
+                    "status": "OPEN",
+                    "realized_pnl": "",
+                    "close_time": "",
+                },
+            )
+
+            # ── Compute PnL figures for Telegram ─────────────────────────
+            total_pnl = _get_total_pnl(bot_id)
+            daily_pnl = _get_daily_pnl(bot_id)
+            pnl_sign = "+" if total_pnl >= 0 else ""
+            daily_sign = "+" if daily_pnl >= 0 else ""
+
+            # ── Telegram notification ────────────────────────────────────
+            tg_msg = (
+                f"<b>{bot_label} ({symbol}) {direction_str} @ {entry:.5f}</b>\n"
+                f"RR {rr:.1f} | Magic {magic}\n"
+                f"SL: {sl:.5f} | TP: {tp:.5f}\n"
+                f"PnL: {pnl_sign}{total_pnl:.2f} USD | "
+                f"Daily PnL: {daily_sign}{daily_pnl:.2f} USD"
+            )
+            telegram(tg_msg)
+
+            logger.info(
+                "TRADE PLACED – %s  %s @ %.5f | RR %.2f | Magic %d | "
+                "trade_id=%s | PnL %.2f | Daily PnL %.2f",
+                symbol, direction_str, entry, rr, magic,
+                oanda_trade_id, total_pnl, daily_pnl,
+            )
+
+            time.sleep(_POLL_INTERVAL_SECONDS)
+
+    except KeyboardInterrupt:
+        logger.info("%s stopped by user.", bot_label)
+        telegram(f"🛑 {bot_label} ({symbol}) stopped.")
+
+
+# ---------------------------------------------------------------------------
+# Manager entry point
+# ---------------------------------------------------------------------------
+
+def main(bot_ids: list[int] | None = None) -> None:
+    """Start all (or a subset of) bot processes.
+
+    Parameters
+    ----------
+    bot_ids : list[int] | None
+        If given, only start bots whose ``bot_id`` is in this list.
+        Defaults to all 20 bots.
+    """
+    configs = BOT_CONFIGS
+    if bot_ids:
+        configs = [c for c in BOT_CONFIGS if c["bot_id"] in bot_ids]
+    if not configs:
+        print("No matching bot configurations found.")
+        return
+
+    print(f"Starting {len(configs)} bot(s) …")
+    for cfg in configs:
+        print(
+            f"  Bot {cfg['bot_id']:02d}  symbol={cfg['symbol']:<8}  "
+            f"tf={cfg['timeframe']:<4}  magic={cfg['magic']}"
+        )
+
+    processes: list[multiprocessing.Process] = []
+    for cfg in configs:
+        p = multiprocessing.Process(
+            target=run_single_bot,
+            args=(cfg,),
+            name=f"SMCBot-{cfg['bot_id']:02d}",
+            daemon=False,
+        )
+        p.start()
+        processes.append(p)
+        # Small stagger to avoid all bots hammering the API simultaneously
+        time.sleep(0.5)
+
+    print(f"{len(processes)} bot process(es) started.  Press Ctrl+C to stop all.")
+
+    try:
+        for p in processes:
+            p.join()
+    except KeyboardInterrupt:
+        print("\nShutting down all bots …")
+        for p in processes:
+            if p.is_alive():
+                p.terminate()
+        for p in processes:
+            p.join(timeout=5)
+        print("All bots stopped.")
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+def _parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="SMC Bot Manager – run 20 SMC bots on a single OANDA Demo account."
+    )
+    parser.add_argument(
+        "--list-bots",
+        action="store_true",
+        help="Print all bot configurations and exit.",
+    )
+    parser.add_argument(
+        "--bot-ids",
+        default=None,
+        help=(
+            "Comma-separated list of bot IDs to start (1–20).  "
+            "Starts all 20 when omitted.  Example: --bot-ids 1,3,7"
+        ),
+    )
+    return parser.parse_args()
+
+
+if __name__ == "__main__":
+    # Required on Windows / macOS with spawn start method
+    multiprocessing.freeze_support()
+
+    args = _parse_args()
+
+    if args.list_bots:
+        print(f"{'ID':>4}  {'Magic':>6}  {'Symbol':<8}  TF")
+        print("-" * 30)
+        for cfg in BOT_CONFIGS:
+            print(
+                f"{cfg['bot_id']:>4}  {cfg['magic']:>6}  "
+                f"{cfg['symbol']:<8}  {cfg['timeframe']}"
+            )
+    else:
+        selected_ids: list[int] | None = None
+        if args.bot_ids:
+            selected_ids = [
+                int(x.strip()) for x in args.bot_ids.split(",") if x.strip().isdigit()
+            ]
+        main(bot_ids=selected_ids)
