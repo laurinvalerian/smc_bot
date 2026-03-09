@@ -148,6 +148,7 @@ _SESSION_END_HOUR = 17     # 17:00 London time (exclusive)
 _MAX_SPREAD_PIPS = 1.8
 _RISK_PERCENT = 1.0        # % of account balance risked per trade
 _MIN_RR = 2.0
+_LOOKBACK = 30             # Rolling-window size (bars) for signal detection
 _MAX_DAILY_LOSS_PCT = 3.0  # % of start-of-day equity
 _POLL_INTERVAL_SECONDS = 60
 _BARS_NEEDED = 200
@@ -169,16 +170,150 @@ _BOT_DIR = Path(__file__).parent
 
 # ---------------------------------------------------------------------------
 # Bot configurations  (20 bots – each trades ALL 10 major pairs on M5)
+# Each bot uses its own Top-20 optimisation parameters.
 # ---------------------------------------------------------------------------
 
 BOT_CONFIGS: list[dict] = [
+    # Bot 1
     {
-        "bot_id": _i,
-        "magic": 1000 + _i,
-        "symbols": list(_MAJOR_PAIRS),
-        "timeframe": "M5",
-    }
-    for _i in range(1, 21)
+        "bot_id": 1, "magic": 1001,
+        "symbols": list(_MAJOR_PAIRS), "timeframe": "M5",
+        "session_start": 7, "session_end": 19,
+        "max_spread": 3.0, "min_rr": 2.5, "lookback": 30, "risk": 0.5,
+    },
+    # Bot 2
+    {
+        "bot_id": 2, "magic": 1002,
+        "symbols": list(_MAJOR_PAIRS), "timeframe": "M5",
+        "session_start": 7, "session_end": 19,
+        "max_spread": 3.0, "min_rr": 3.0, "lookback": 30, "risk": 0.5,
+    },
+    # Bot 3
+    {
+        "bot_id": 3, "magic": 1003,
+        "symbols": list(_MAJOR_PAIRS), "timeframe": "M5",
+        "session_start": 7, "session_end": 19,
+        "max_spread": 2.5, "min_rr": 2.5, "lookback": 30, "risk": 0.5,
+    },
+    # Bot 4
+    {
+        "bot_id": 4, "magic": 1004,
+        "symbols": list(_MAJOR_PAIRS), "timeframe": "M5",
+        "session_start": 7, "session_end": 19,
+        "max_spread": 2.5, "min_rr": 3.0, "lookback": 30, "risk": 0.5,
+    },
+    # Bot 5
+    {
+        "bot_id": 5, "magic": 1005,
+        "symbols": list(_MAJOR_PAIRS), "timeframe": "M5",
+        "session_start": 7, "session_end": 19,
+        "max_spread": 2.2, "min_rr": 2.5, "lookback": 30, "risk": 0.5,
+    },
+    # Bot 6
+    {
+        "bot_id": 6, "magic": 1006,
+        "symbols": list(_MAJOR_PAIRS), "timeframe": "M5",
+        "session_start": 7, "session_end": 19,
+        "max_spread": 2.2, "min_rr": 3.0, "lookback": 30, "risk": 0.5,
+    },
+    # Bot 7
+    {
+        "bot_id": 7, "magic": 1007,
+        "symbols": list(_MAJOR_PAIRS), "timeframe": "M5",
+        "session_start": 7, "session_end": 19,
+        "max_spread": 3.0, "min_rr": 1.8, "lookback": 30, "risk": 0.5,
+    },
+    # Bot 8
+    {
+        "bot_id": 8, "magic": 1008,
+        "symbols": list(_MAJOR_PAIRS), "timeframe": "M5",
+        "session_start": 7, "session_end": 19,
+        "max_spread": 2.5, "min_rr": 1.8, "lookback": 30, "risk": 0.5,
+    },
+    # Bot 9
+    {
+        "bot_id": 9, "magic": 1009,
+        "symbols": list(_MAJOR_PAIRS), "timeframe": "M5",
+        "session_start": 7, "session_end": 19,
+        "max_spread": 3.0, "min_rr": 4.0, "lookback": 30, "risk": 0.5,
+    },
+    # Bot 10
+    {
+        "bot_id": 10, "magic": 1010,
+        "symbols": list(_MAJOR_PAIRS), "timeframe": "M5",
+        "session_start": 7, "session_end": 19,
+        "max_spread": 2.2, "min_rr": 1.8, "lookback": 30, "risk": 0.5,
+    },
+    # Bot 11
+    {
+        "bot_id": 11, "magic": 1011,
+        "symbols": list(_MAJOR_PAIRS), "timeframe": "M5",
+        "session_start": 7, "session_end": 19,
+        "max_spread": 3.0, "min_rr": 2.0, "lookback": 30, "risk": 0.5,
+    },
+    # Bot 12
+    {
+        "bot_id": 12, "magic": 1012,
+        "symbols": list(_MAJOR_PAIRS), "timeframe": "M5",
+        "session_start": 7, "session_end": 19,
+        "max_spread": 2.5, "min_rr": 4.0, "lookback": 30, "risk": 0.5,
+    },
+    # Bot 13
+    {
+        "bot_id": 13, "magic": 1013,
+        "symbols": list(_MAJOR_PAIRS), "timeframe": "M5",
+        "session_start": 7, "session_end": 19,
+        "max_spread": 3.0, "min_rr": 2.2, "lookback": 30, "risk": 0.5,
+    },
+    # Bot 14
+    {
+        "bot_id": 14, "magic": 1014,
+        "symbols": list(_MAJOR_PAIRS), "timeframe": "M5",
+        "session_start": 7, "session_end": 19,
+        "max_spread": 2.5, "min_rr": 2.0, "lookback": 30, "risk": 0.5,
+    },
+    # Bot 15
+    {
+        "bot_id": 15, "magic": 1015,
+        "symbols": list(_MAJOR_PAIRS), "timeframe": "M5",
+        "session_start": 7, "session_end": 19,
+        "max_spread": 2.5, "min_rr": 2.2, "lookback": 30, "risk": 0.5,
+    },
+    # Bot 16
+    {
+        "bot_id": 16, "magic": 1016,
+        "symbols": list(_MAJOR_PAIRS), "timeframe": "M5",
+        "session_start": 7, "session_end": 19,
+        "max_spread": 2.2, "min_rr": 4.0, "lookback": 30, "risk": 0.5,
+    },
+    # Bot 17
+    {
+        "bot_id": 17, "magic": 1017,
+        "symbols": list(_MAJOR_PAIRS), "timeframe": "M5",
+        "session_start": 7, "session_end": 19,
+        "max_spread": 2.0, "min_rr": 2.5, "lookback": 30, "risk": 0.5,
+    },
+    # Bot 18
+    {
+        "bot_id": 18, "magic": 1018,
+        "symbols": list(_MAJOR_PAIRS), "timeframe": "M5",
+        "session_start": 7, "session_end": 19,
+        "max_spread": 2.2, "min_rr": 2.0, "lookback": 30, "risk": 0.5,
+    },
+    # Bot 19
+    {
+        "bot_id": 19, "magic": 1019,
+        "symbols": list(_MAJOR_PAIRS), "timeframe": "M5",
+        "session_start": 7, "session_end": 19,
+        "max_spread": 2.2, "min_rr": 2.2, "lookback": 30, "risk": 0.5,
+    },
+    # Bot 20
+    {
+        "bot_id": 20, "magic": 1020,
+        "symbols": list(_MAJOR_PAIRS), "timeframe": "M5",
+        "session_start": 7, "session_end": 19,
+        "max_spread": 1.8, "min_rr": 2.5, "lookback": 30, "risk": 0.5,
+    },
 ]
 
 
@@ -356,14 +491,18 @@ def _send_telegram(message: str, token: str, chat_id: str, logger: logging.Logge
 # Session filter (shared with live_bot)
 # ---------------------------------------------------------------------------
 
-def _in_session(dt_utc: datetime) -> bool:
-    """Return True when *dt_utc* falls within 08:00–17:00 London time."""
+def _in_session(
+    dt_utc: datetime,
+    start_hour: int = _SESSION_START_HOUR,
+    end_hour: int = _SESSION_END_HOUR,
+) -> bool:
+    """Return True when *dt_utc* falls within *start_hour*–*end_hour* London time."""
     if _LONDON_TZ is None:
         london_hour = dt_utc.hour
     else:
         london_dt = dt_utc.astimezone(_LONDON_TZ)
         london_hour = london_dt.hour
-    return _SESSION_START_HOUR <= london_hour < _SESSION_END_HOUR
+    return start_hour <= london_hour < end_hour
 
 
 # ---------------------------------------------------------------------------
@@ -637,7 +776,9 @@ def run_single_bot(config: dict) -> None:
     Parameters
     ----------
     config : dict
-        Keys: ``bot_id``, ``magic``, ``symbols``, ``timeframe``.
+        Keys: ``bot_id``, ``magic``, ``symbols``, ``timeframe``,
+        ``session_start``, ``session_end``, ``max_spread``,
+        ``min_rr``, ``lookback``, ``risk``.
         Each bot trades **all symbols** in the list simultaneously (multi-symbol
         mode identical to ``live_bot.py``).
     """
@@ -645,6 +786,12 @@ def run_single_bot(config: dict) -> None:
     magic: int = config["magic"]
     symbols: list[str] = config["symbols"]
     timeframe: str = config["timeframe"]
+    session_start: int = config.get("session_start", _SESSION_START_HOUR)
+    session_end: int = config.get("session_end", _SESSION_END_HOUR)
+    max_spread: float = config.get("max_spread", _MAX_SPREAD_PIPS)
+    min_rr: float = config.get("min_rr", _MIN_RR)
+    lookback: int = config.get("lookback", _LOOKBACK)
+    risk_percent: float = config.get("risk", _RISK_PERCENT)
     bot_label = f"Bot {bot_id:02d}"
 
     # Set up per-bot logger
@@ -697,11 +844,14 @@ def run_single_bot(config: dict) -> None:
     last_bar_times: dict[str, "pd.Timestamp | None"] = {sym: None for sym in symbols}
 
     logger.info(
-        "%s started – symbols=%s  tf=%s  magic=%d  env=%s",
+        "%s started – symbols=%s  tf=%s  magic=%d  env=%s  "
+        "session=%02d-%02dh  max_spread=%.1f  min_rr=%.1f  lookback=%d  risk=%.1f%%",
         bot_label, ",".join(symbols), timeframe, magic, environment,
+        session_start, session_end, max_spread, min_rr, lookback, risk_percent,
     )
     telegram(
-        f"🤖 {bot_label} started – {len(symbols)} pairs – tf={timeframe} – magic={magic}"
+        f"🤖 {bot_label} started – {len(symbols)} pairs – tf={timeframe} – magic={magic} – "
+        f"session={session_start:02d}-{session_end:02d}h – spread≤{max_spread} – RR≥{min_rr}"
     )
 
     try:
@@ -725,7 +875,7 @@ def run_single_bot(config: dict) -> None:
                 continue
 
             # ── Session filter ───────────────────────────────────────────
-            if not _in_session(now_utc):
+            if not _in_session(now_utc, session_start, session_end):
                 time.sleep(_POLL_INTERVAL_SECONDS)
                 continue
 
@@ -754,7 +904,7 @@ def run_single_bot(config: dict) -> None:
 
                 # Spread filter (per symbol)
                 spread = _get_spread_pips(client, account_id, symbol, logger)
-                if spread >= _MAX_SPREAD_PIPS:
+                if spread >= max_spread:
                     logger.debug(
                         "[%s] Spread %.3f pips too wide – skipping.", symbol, spread
                     )
@@ -774,9 +924,10 @@ def run_single_bot(config: dict) -> None:
                 try:
                     sig_df = generate_signals(
                         df,
-                        risk_percent=_RISK_PERCENT,
+                        risk_percent=risk_percent,
                         account_balance=balance,
-                        min_rr=_MIN_RR,
+                        lookback=lookback,
+                        min_rr=min_rr,
                     )
                 except Exception as exc:  # noqa: BLE001
                     logger.error("[%s] generate_signals error: %s", symbol, exc)
@@ -896,7 +1047,10 @@ def main(bot_ids: list[int] | None = None) -> None:
     for cfg in configs:
         print(
             f"  Bot {cfg['bot_id']:02d}  symbols={len(cfg['symbols'])} pairs  "
-            f"tf={cfg['timeframe']:<4}  magic={cfg['magic']}"
+            f"tf={cfg['timeframe']:<4}  magic={cfg['magic']}  "
+            f"spread≤{cfg.get('max_spread', _MAX_SPREAD_PIPS):.1f}  "
+            f"RR≥{cfg.get('min_rr', _MIN_RR):.1f}  "
+            f"risk={cfg.get('risk', _RISK_PERCENT):.1f}%"
         )
 
     processes: list[multiprocessing.Process] = []
@@ -958,13 +1112,20 @@ if __name__ == "__main__":
     args = _parse_args()
 
     if args.list_bots:
-        pairs_str = ",".join(_MAJOR_PAIRS)
-        print(f"{'ID':>4}  {'Magic':>6}  {'Symbols':<62}  TF")
-        print("-" * 82)
+        print(
+            f"{'ID':>4}  {'Magic':>6}  {'Spread':>7}  {'MinRR':>6}  "
+            f"{'Lookback':>8}  {'Risk%':>6}  {'Session':>12}  TF"
+        )
+        print("-" * 70)
         for cfg in BOT_CONFIGS:
+            sess = f"{cfg.get('session_start', _SESSION_START_HOUR):02d}-{cfg.get('session_end', _SESSION_END_HOUR):02d}h"
             print(
                 f"{cfg['bot_id']:>4}  {cfg['magic']:>6}  "
-                f"{pairs_str:<62}  {cfg['timeframe']}"
+                f"{cfg.get('max_spread', _MAX_SPREAD_PIPS):>7.1f}  "
+                f"{cfg.get('min_rr', _MIN_RR):>6.1f}  "
+                f"{cfg.get('lookback', 10):>8}  "
+                f"{cfg.get('risk', _RISK_PERCENT):>6.1f}  "
+                f"{sess:>12}  {cfg['timeframe']}"
             )
     else:
         selected_ids: list[int] | None = None
