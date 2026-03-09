@@ -44,7 +44,7 @@ Safeguards (all GLOBAL across all symbols)
     * Max 3 open trades at any time (across all symbols)
     * Max 3 % daily loss (relative to start-of-day equity)
     * Only trades during London + NY session: 08:00–17:00 London time
-    * Spread filter: < 0.6 pips (evaluated per symbol)
+    * Spread filter: < 1.8 pips (evaluated per symbol)
 
 Rules (same as backtester / smc_strategy)
 ------------------------------------------
@@ -118,7 +118,7 @@ from smc_strategy import generate_signals
 # ---------------------------------------------------------------------------
 _SESSION_START_HOUR = 8   # 08:00 London time
 _SESSION_END_HOUR = 17    # 17:00 London time (exclusive)
-_MAX_SPREAD_PIPS = 0.6
+_MAX_SPREAD_PIPS = 1.8
 _RISK_PERCENT = 1.0        # % of account balance risked per trade
 _MIN_RR = 2.0
 _MAX_OPEN_TRADES = 3
@@ -565,10 +565,6 @@ def run_bot(
                     "Daily loss limit (%.1f%%) reached – no new trades today.",
                     _MAX_DAILY_LOSS_PCT,
                 )
-                print(
-                    f"[{now_utc.strftime('%Y-%m-%d %H:%M')}] "
-                    f"⚠  Daily loss limit reached – no new trades.  equity {equity:.2f}"
-                )
                 time.sleep(_POLL_INTERVAL_SECONDS)
                 continue
 
@@ -584,9 +580,14 @@ def run_bot(
             # ----------------------------------------------------------
             open_count = _count_open_trades(client, account_id)
             if open_count >= _MAX_OPEN_TRADES:
+                log.info(
+                    "Max open trades (%d) reached – skipping cycle.", open_count
+                )
                 print(
                     f"[{now_utc.strftime('%Y-%m-%d %H:%M')}] "
-                    f"Checked {len(symbols)} symbols – max open trades ({open_count}) reached – "
+                    f"Checked {len(symbols)} symbols – "
+                    f"0 new signals – "
+                    f"{open_count} open trade{'s' if open_count != 1 else ''} – "
                     f"equity {equity:.2f}"
                 )
                 time.sleep(_POLL_INTERVAL_SECONDS)
