@@ -21,14 +21,15 @@ Parameter Grid
   session_start_hour : [5, 6, 7, 8, 9]
   session_end_hour   : [16, 17, 18, 19, 20, 21]
   max_spread_pips    : [0.8, 1.2, 1.5, 1.8, 2.2, 2.5, 3.0, 4.0]
-  min_rr             : [1.5, 1.8, 2.0, 2.2, 2.5, 3.0]
+  min_rr             : [1.5, 2.0, 3.0, 4.0, 5.0]
   lookback           : [5, 8, 12, 15, 20, 25, 30]
   risk_percent       : [0.5, 1.0, 2.0, 3.0]
 
 Outputs
 -------
-  optimization_results.csv  – all combinations with Train + Test metrics
-  top_15.txt                – top 15 rows by Score (Test period)
+  optimization_results.csv  – all combinations with Train + Test metrics,
+                              sorted descending by test_net_profit_pct
+  top_20_net_profit.txt     – top 20 rows by Net Profit (Test period)
 
 Usage
 -----
@@ -65,7 +66,7 @@ PARAM_GRID: dict[str, list] = {
     "session_start_hour": [5, 6, 7, 8, 9],
     "session_end_hour":   [16, 17, 18, 19, 20, 21],
     "max_spread_pips":    [0.8, 1.2, 1.5, 1.8, 2.2, 2.5, 3.0, 4.0],
-    "min_rr":             [1.5, 1.8, 2.0, 2.2, 2.5, 3.0],
+    "min_rr":             [1.5, 2.0, 3.0, 4.0, 5.0],
     "lookback":           [5, 8, 12, 15, 20, 25, 30],
     "risk_percent":       [0.5, 1.0, 2.0, 3.0],
 }
@@ -506,10 +507,12 @@ def _run_combo(params_tuple: tuple) -> dict | None:
     train_agg = _agg_pairs(_PRECOMP_TRAIN, params)
     test_agg  = _agg_pairs(_PRECOMP_TEST,  params)
 
-    score = (
-        test_agg["profit_factor"] * test_agg["winrate"]
-        / (test_agg["max_dd"] + 0.01)
-    )
+    # Primary score = net profit of the test period (final account balance in %)
+    score = test_agg["net_profit"]
+
+    # stable_score helps filter later: reward profit relative to drawdown
+    # The +5 offset prevents extreme values when drawdown is near zero
+    stable_score = test_agg["net_profit"] / (test_agg["max_dd"] + 5)
 
     return {
         # Parameters
@@ -531,8 +534,9 @@ def _run_combo(params_tuple: tuple) -> dict | None:
         "test_profit_factor":  round(test_agg["profit_factor"], 4),
         "test_net_profit_pct": round(test_agg["net_profit"], 4),
         "test_max_dd":         round(test_agg["max_dd"], 4),
-        # Ranking score (based on out-of-sample period)
+        # Ranking score = test_net_profit_pct (primary) and stable_score (secondary)
         "score":               round(score, 6),
+        "stable_score":        round(stable_score, 6),
     }
 
 
@@ -546,13 +550,13 @@ def run_optimization() -> pd.DataFrame:
     Returns
     -------
     pd.DataFrame
-        All results sorted by ``score`` descending.
+        All results sorted by ``test_net_profit_pct`` descending.
     """
     from data_loader import load_all_pairs
 
     base_dir     = os.path.dirname(os.path.abspath(__file__))
     results_path = os.path.join(base_dir, "optimization_results.csv")
-    top15_path   = os.path.join(base_dir, "top_15.txt")
+    top20_path   = os.path.join(base_dir, "top_20_net_profit.txt")
 
     print("=" * 70)
     print("SMC Grid-Search Optimizer")
@@ -661,45 +665,47 @@ def run_optimization() -> pd.DataFrame:
         print("No valid results. Check your data / parameter grid.")
         return results_df
 
-    results_df.sort_values("score", ascending=False, inplace=True)
+    results_df.sort_values("test_net_profit_pct", ascending=False, inplace=True)
     results_df.reset_index(drop=True, inplace=True)
 
     results_df.to_csv(results_path, index=False)
     print(f"\n[4/4] All {len(results_df):,} results saved to: {results_path}")
 
     # ------------------------------------------------------------------
-    # 6. Top 15
+    # 6. Top 20 by Net Profit
     # ------------------------------------------------------------------
-    top15 = results_df.head(15).copy()
-    top15.insert(0, "rank", range(1, len(top15) + 1))
+    top20 = results_df.head(20).copy()
+    top20.insert(0, "rank", range(1, len(top20) + 1))
 
     # Build display-friendly table
+    # Note: 'score' == 'test_net_profit_pct' (redundant), so only the latter is shown
     display_cols = [
         "rank",
         "session_start_hour", "session_end_hour",
         "max_spread_pips", "min_rr", "lookback", "risk_percent",
         "test_trades", "test_winrate", "test_profit_factor",
         "test_net_profit_pct", "test_max_dd",
-        "score",
+        "stable_score",
     ]
-    top15_display = top15[display_cols].to_string(index=False)
+    top20_display = top20[display_cols].to_string(index=False)
 
     separator = "=" * 80
-    top15_text = (
+    top20_text = (
         f"{separator}\n"
-        f"TOP 15 PARAMETER COMBINATIONS\n"
-        f"  Score  =  (Profit Factor × Winrate)  /  (Max DD + 0.01)\n"
+        f"TOP 20 PARAMETER COMBINATIONS (sorted by Net Profit)\n"
+        f"  Score  =  test_net_profit_pct  (final account balance in %)\n"
+        f"  stable_score = test_net_profit_pct / (test_max_dd + 5)\n"
         f"  Period : Out-of-Sample  {TEST_START} → {TEST_END}\n"
         f"  Cost   : {ROUND_TRIP_PIPS} pip round-trip per trade (fixed)\n"
         f"{separator}\n\n"
-        f"{top15_display}\n\n"
+        f"{top20_display}\n\n"
         f"{separator}\n"
     )
 
-    print("\n" + top15_text)
-    with open(top15_path, "w", encoding="utf-8") as fh:
-        fh.write(top15_text)
-    print(f"Top 15 saved to: {top15_path}")
+    print("\n" + top20_text)
+    with open(top20_path, "w", encoding="utf-8") as fh:
+        fh.write(top20_text)
+    print(f"Top 20 saved to: {top20_path}")
 
     return results_df
 
