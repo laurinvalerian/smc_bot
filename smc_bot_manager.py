@@ -977,94 +977,8 @@ def run_single_bot(config: dict) -> None:
                     )
                     continue
 
-                # ── Filter analysis when signal == 0 ─────────────────────
-                if signal == 0 or np.isnan(last_closed["entry"]):
-                    close_price = float(last_closed["close"])
-                    discount_50_raw = last_closed.get("discount_50", np.nan)
-                    discount_50_f = (
-                        float(discount_50_raw)
-                        if not pd.isna(discount_50_raw)
-                        else np.nan
-                    )
-                    pool_above_raw = last_closed.get("liquidity_pool_above", np.nan)
-                    pool_below_raw = last_closed.get("liquidity_pool_below", np.nan)
-                    pool_above_f = (
-                        float(pool_above_raw) if not pd.isna(pool_above_raw) else np.nan
-                    )
-                    pool_below_f = (
-                        float(pool_below_raw) if not pd.isna(pool_below_raw) else np.nan
-                    )
-                    liq_below_recent = bool(lb_slice["liquidity_swept_below"].max())
-                    liq_above_recent = bool(lb_slice["liquidity_swept_above"].max())
-                    in_discount = (
-                        close_price < discount_50_f if not np.isnan(discount_50_f)
-                        else False
-                    )
-                    in_premium = (
-                        close_price > discount_50_f if not np.isnan(discount_50_f)
-                        else False
-                    )
-
-                    # Log: daily bias (BOS direction) – only when filter is active
-                    if daily_bias_filter != "off":
-                        if not (has_bull_bos or has_bear_bos):
-                            logger.info(
-                                "[%s] Filtered: Daily bias not bullish/bearish", symbol
-                            )
-
-                    # Log: liquidity pool for TP target – only when filter is active
-                    if liq_pool_filter:
-                        if np.isnan(pool_above_f) and np.isnan(pool_below_f):
-                            logger.info(
-                                "[%s] Filtered: No liquidity pool nearby", symbol
-                            )
-
-                    # Log: potential RR for long setup
-                    if (
-                        has_bull_fvg and has_bull_bos
-                        and liq_below_recent and in_discount
-                        and not np.isnan(pool_above_f)
-                    ):
-                        sl_raw = last_closed.get("swing_low_level", np.nan)
-                        sl_val = (
-                            float(sl_raw) if not pd.isna(sl_raw) else np.nan
-                        )
-                        if (
-                            not np.isnan(sl_val)
-                            and sl_val < close_price < pool_above_f
-                        ):
-                            sl_dist = close_price - sl_val
-                            if sl_dist > 0:
-                                rr_potential = (pool_above_f - close_price) / sl_dist
-                                if rr_potential < min_rr:
-                                    logger.info(
-                                        "[%s] Filtered: RR only %.1f < min_rr %.1f",
-                                        symbol, rr_potential, min_rr,
-                                    )
-
-                    # Log: potential RR for short setup
-                    elif (
-                        has_bear_fvg and has_bear_bos
-                        and liq_above_recent and in_premium
-                        and not np.isnan(pool_below_f)
-                    ):
-                        sl_raw = last_closed.get("swing_high_level", np.nan)
-                        sl_val = (
-                            float(sl_raw) if not pd.isna(sl_raw) else np.nan
-                        )
-                        if (
-                            not np.isnan(sl_val)
-                            and pool_below_f < close_price < sl_val
-                        ):
-                            sl_dist = sl_val - close_price
-                            if sl_dist > 0:
-                                rr_potential = (close_price - pool_below_f) / sl_dist
-                                if rr_potential < min_rr:
-                                    logger.info(
-                                        "[%s] Filtered: RR only %.1f < min_rr %.1f",
-                                        symbol, rr_potential, min_rr,
-                                    )
-
+                # ── Skip if no actionable signal on last closed bar ───────
+                if signal == 0 or np.isnan(last_closed.get("entry", np.nan)):
                     continue
 
                 # ── Signal passed all filters ─────────────────────────────
@@ -1214,9 +1128,8 @@ def run_single_bot(config: dict) -> None:
                     },
                 )
 
-                # Refresh balance and open-count after successful fill
+                # Increment open-count after successful fill
                 open_count += 1
-                balance = _get_balance(client, account_id, logger)
 
                 # ── Compute PnL figures for Telegram ─────────────────────
                 total_pnl = _get_total_pnl(bot_id)
