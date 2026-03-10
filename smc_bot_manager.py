@@ -877,7 +877,13 @@ def run_single_bot(config: dict) -> None:
                     except Exception:  # noqa: BLE001
                         break  # queue empty
 
-            equity = _get_equity(client, account_id, logger)
+            # Single AccountSummary call per cycle – provides both equity and balance.
+            # NAV (Net Asset Value) is used as equity; balance is the cash component.
+            # If the API call fails, _get_account_summary returns {} and both
+            # values default to 0.0 (the error is already logged inside that helper).
+            _acct = _get_account_summary(client, account_id, logger)
+            balance = float(_acct.get("balance", 0.0))
+            equity = float(_acct.get("NAV", balance))  # NAV primary, balance as fallback
             daily_guard.update(equity, today_int)
 
             # ── Update PnL for any trades that closed since last cycle ───
@@ -900,9 +906,6 @@ def run_single_bot(config: dict) -> None:
                 )
                 time.sleep(_POLL_INTERVAL_SECONDS)
                 continue
-
-            # Fetch balance once per cycle; refreshed after each successful fill
-            balance = _get_balance(client, account_id, logger)
 
             # ── Iterate over every symbol in one loop pass ───────────────
             for symbol in symbols:
@@ -1002,17 +1005,19 @@ def run_single_bot(config: dict) -> None:
                         else False
                     )
 
-                    # Log: daily bias (BOS direction)
-                    if not (has_bull_bos or has_bear_bos):
-                        logger.info(
-                            "[%s] Filtered: Daily bias not bullish/bearish", symbol
-                        )
+                    # Log: daily bias (BOS direction) – only when filter is active
+                    if daily_bias_filter != "off":
+                        if not (has_bull_bos or has_bear_bos):
+                            logger.info(
+                                "[%s] Filtered: Daily bias not bullish/bearish", symbol
+                            )
 
-                    # Log: liquidity pool for TP target
-                    if np.isnan(pool_above_f) and np.isnan(pool_below_f):
-                        logger.info(
-                            "[%s] Filtered: No liquidity pool nearby", symbol
-                        )
+                    # Log: liquidity pool for TP target – only when filter is active
+                    if liq_pool_filter:
+                        if np.isnan(pool_above_f) and np.isnan(pool_below_f):
+                            logger.info(
+                                "[%s] Filtered: No liquidity pool nearby", symbol
+                            )
 
                     # Log: potential RR for long setup
                     if (
