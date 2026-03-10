@@ -444,6 +444,7 @@ def run_data_manager(
     symbols: List[str],
     environment: str,
     queues: list,
+    log_dir: str = "",
 ) -> None:
     """Run the DataManager in its own process.
 
@@ -456,11 +457,24 @@ def run_data_manager(
     queues       : List of :class:`multiprocessing.Queue` instances – one per
                    bot.  The manager pushes ``(symbol, tf, df)`` tuples to
                    every queue whenever a bar closes.
+    log_dir      : Optional path to the logs directory.  When provided the
+                   DataManager appends to ``<log_dir>/manager.log`` instead of
+                   writing to stdout only.
     """
+    from pathlib import Path as _Path
+
+    handlers: List[logging.Handler] = [logging.StreamHandler()]
+    if log_dir:
+        _ld = _Path(log_dir)
+        _ld.mkdir(parents=True, exist_ok=True)
+        _lp = _ld / "manager.log"
+        handlers.append(logging.FileHandler(str(_lp), encoding="utf-8"))
+
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s  [DataManager]  %(levelname)-5s  %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
+        handlers=handlers,
     )
 
     dm = DataManager(

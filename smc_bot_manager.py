@@ -2,9 +2,11 @@
 
 Overview
 --------
-Each of the 20 bots is identified by a unique **Magic Number** (1001–1020)
-that is embedded in the OANDA order's ``clientExtensions.id``.  All 20 bots
-run in parallel via :mod:`multiprocessing`.
+20 bots are derived from the **Top-5 optimised parameter sets**, each expanded
+into **4 filter variants** (Sehr_Locker / Locker / Original / Streng).
+Every bot is identified by a unique **Magic Number** (1001–1020) embedded in
+the OANDA order's ``clientExtensions.id``.  All 20 bots run in parallel via
+:mod:`multiprocessing`.
 
 A single **DataManager** process (from ``data_manager.py``) preloads history
 once on start-up (500 bars each for M5, H4, D1) and then streams live prices
@@ -13,25 +15,32 @@ pushes ``(symbol, tf, dataframe)`` tuples to each bot's dedicated
 :class:`multiprocessing.Queue`.  Bots drain their queues every cycle instead
 of making their own REST calls for candle data.
 
-Bot configuration
------------------
-* All 20 bots trade **all 10 major FX pairs simultaneously** on M5 – identical
-  to the multi-symbol mode of ``live_bot.py``.  The only difference between
-  bots is the magic number, which allows positions to be tracked separately.
+Bot variants (per Top-5 set)
+-----------------------------
+* **Sehr_Locker** – min_rr=1.5, lookback=50, daily_bias=off,  liq_pool=off
+* **Locker**      – min_rr=1.8, lookback=40, daily_bias=weak, liq_pool=off
+* **Original**    – exact optimised values,  daily_bias=normal,liq_pool=on
+* **Streng**      – min_rr=2.5, lookback=20, daily_bias=very_strong,liq_pool=on
+
+Bot names & IDs
+---------------
+    Bot_01_Sehr_Locker (magic=1001) … Bot_01_Streng (magic=1004)
+    Bot_02_Sehr_Locker (magic=1005) … Bot_05_Streng (magic=1020)
 
 Symbols traded by every bot
 ----------------------------
     EURUSD, GBPUSD, USDJPY, AUDUSD, USDCAD,
     NZDUSD, EURJPY, GBPJPY, USDCHF, EURGBP
 
-Files produced per bot
-----------------------
-* ``bot_01.log``         … ``bot_20.log``          (structured text log)
-* ``trades_bot_01.csv``  … ``trades_bot_20.csv``   (every trade with full details)
+Folder structure (auto-created on start)
+-----------------------------------------
+* ``logs/manager.log``           central Manager + DataManager log
+* ``logs/bot_01.log`` …          one log file per bot
+* ``trades/trades_bot_01.csv`` … one CSV per bot
 
 Telegram format (on every filled trade)
 ----------------------------------------
-    Bot 07 (EURUSD) LONG @ 1.0854 | RR 3.8 | Magic 1007
+    Bot_02_Original (EURUSD) LONG @ 1.0854 | RR 3.0 | Magic 1007
     PnL: +12.34 USD | Daily PnL: +34.56 USD
 
 Usage
@@ -57,8 +66,8 @@ Create a ``.env`` file in the same directory with:
     TELEGRAM_TOKEN=123456789:AAxxxxxx...
     TELEGRAM_CHAT_ID=-1001234567890
 
-Ubuntu / tmux Quick-Start
---------------------------
+Ubuntu / tmux Quick-Start  (single screen session)
+----------------------------------------------------
     # 1. Install dependencies (once):
     pip install oandapyV20 requests pandas numpy smartmoneyconcepts pytz python-dotenv
 
@@ -177,153 +186,99 @@ _TF_MAP = {
 # Base directory – same folder as this script
 _BOT_DIR = Path(__file__).parent
 
+# Sub-directories for logs and trade CSVs (auto-created on start)
+_LOGS_DIR   = _BOT_DIR / "logs"
+_TRADES_DIR = _BOT_DIR / "trades"
+
 # ---------------------------------------------------------------------------
-# Bot configurations  (20 bots – each trades ALL 10 major pairs on M5)
-# Each bot uses its own Top-20 optimisation parameters.
+# Top-5 optimised parameter sets (base configurations)
 # ---------------------------------------------------------------------------
 
-BOT_CONFIGS: list[dict] = [
-    # Bot 1
+_TOP5_PARAMS = [
+    # These are the exact Top-5 parameter sets from the optimisation run.
+    # Some share the same min_rr/lookback values but are treated as independent
+    # seeds so that each of the 4 variants (Sehr_Locker … Streng) produces a
+    # distinctly-named and independently-tracked bot.
+    {"set_id": 1, "min_rr": 2.5, "lookback": 30},
+    {"set_id": 2, "min_rr": 3.0, "lookback": 30},
+    {"set_id": 3, "min_rr": 2.5, "lookback": 30},
+    {"set_id": 4, "min_rr": 3.0, "lookback": 30},
+    {"set_id": 5, "min_rr": 2.5, "lookback": 30},
+]
+
+# ---------------------------------------------------------------------------
+# 4 filter variants applied to every Top-5 set
+# ---------------------------------------------------------------------------
+# daily_bias_filter values:
+#   "off"         – skip BOS-direction check entirely
+#   "weak"        – require any BOS in lookback window
+#   "normal"      – require BOS aligned with trade direction
+#   "very_strong" – require BOS + FVG + price-position alignment + liq sweep
+# liquidity_pool_filter: True = require nearby pool for TP, False = skip
+
+_VARIANT_DEFS = [
     {
-        "bot_id": 1, "magic": 1001,
-        "symbols": list(_MAJOR_PAIRS), "timeframe": "M5",
-        "session_start": 7, "session_end": 19,
-        "max_spread": 3.0, "min_rr": 2.5, "lookback": 30, "risk": 0.5,
+        "variant": "Sehr_Locker",
+        "min_rr": 1.5, "lookback": 50,
+        "daily_bias_filter": "off",
+        "liquidity_pool_filter": False,
     },
-    # Bot 2
     {
-        "bot_id": 2, "magic": 1002,
-        "symbols": list(_MAJOR_PAIRS), "timeframe": "M5",
-        "session_start": 7, "session_end": 19,
-        "max_spread": 3.0, "min_rr": 3.0, "lookback": 30, "risk": 0.5,
+        "variant": "Locker",
+        "min_rr": 1.8, "lookback": 40,
+        "daily_bias_filter": "weak",
+        "liquidity_pool_filter": False,
     },
-    # Bot 3
     {
-        "bot_id": 3, "magic": 1003,
-        "symbols": list(_MAJOR_PAIRS), "timeframe": "M5",
-        "session_start": 7, "session_end": 19,
-        "max_spread": 3.0, "min_rr": 2.5, "lookback": 30, "risk": 0.5,
+        "variant": "Original",
+        "min_rr": None, "lookback": None,   # inherit from Top-5 set
+        "daily_bias_filter": "normal",
+        "liquidity_pool_filter": True,
     },
-    # Bot 4
     {
-        "bot_id": 4, "magic": 1004,
-        "symbols": list(_MAJOR_PAIRS), "timeframe": "M5",
-        "session_start": 7, "session_end": 19,
-        "max_spread": 3.0, "min_rr": 3.0, "lookback": 30, "risk": 0.5,
-    },
-    # Bot 5
-    {
-        "bot_id": 5, "magic": 1005,
-        "symbols": list(_MAJOR_PAIRS), "timeframe": "M5",
-        "session_start": 7, "session_end": 19,
-        "max_spread": 3.0, "min_rr": 2.5, "lookback": 30, "risk": 0.5,
-    },
-    # Bot 6
-    {
-        "bot_id": 6, "magic": 1006,
-        "symbols": list(_MAJOR_PAIRS), "timeframe": "M5",
-        "session_start": 7, "session_end": 19,
-        "max_spread": 3.0, "min_rr": 3.0, "lookback": 30, "risk": 0.5,
-    },
-    # Bot 7
-    {
-        "bot_id": 7, "magic": 1007,
-        "symbols": list(_MAJOR_PAIRS), "timeframe": "M5",
-        "session_start": 7, "session_end": 19,
-        "max_spread": 3.0, "min_rr": 1.8, "lookback": 30, "risk": 0.5,
-    },
-    # Bot 8
-    {
-        "bot_id": 8, "magic": 1008,
-        "symbols": list(_MAJOR_PAIRS), "timeframe": "M5",
-        "session_start": 7, "session_end": 19,
-        "max_spread": 3.0, "min_rr": 1.8, "lookback": 30, "risk": 0.5,
-    },
-    # Bot 9
-    {
-        "bot_id": 9, "magic": 1009,
-        "symbols": list(_MAJOR_PAIRS), "timeframe": "M5",
-        "session_start": 7, "session_end": 19,
-        "max_spread": 3.0, "min_rr": 4.0, "lookback": 30, "risk": 0.5,
-    },
-    # Bot 10
-    {
-        "bot_id": 10, "magic": 1010,
-        "symbols": list(_MAJOR_PAIRS), "timeframe": "M5",
-        "session_start": 7, "session_end": 19,
-        "max_spread": 3.0, "min_rr": 1.8, "lookback": 30, "risk": 0.5,
-    },
-    # Bot 11
-    {
-        "bot_id": 11, "magic": 1011,
-        "symbols": list(_MAJOR_PAIRS), "timeframe": "M5",
-        "session_start": 7, "session_end": 19,
-        "max_spread": 3.0, "min_rr": 2.0, "lookback": 30, "risk": 0.5,
-    },
-    # Bot 12
-    {
-        "bot_id": 12, "magic": 1012,
-        "symbols": list(_MAJOR_PAIRS), "timeframe": "M5",
-        "session_start": 7, "session_end": 19,
-        "max_spread": 3.0, "min_rr": 4.0, "lookback": 30, "risk": 0.5,
-    },
-    # Bot 13
-    {
-        "bot_id": 13, "magic": 1013,
-        "symbols": list(_MAJOR_PAIRS), "timeframe": "M5",
-        "session_start": 7, "session_end": 19,
-        "max_spread": 3.0, "min_rr": 2.2, "lookback": 30, "risk": 0.5,
-    },
-    # Bot 14
-    {
-        "bot_id": 14, "magic": 1014,
-        "symbols": list(_MAJOR_PAIRS), "timeframe": "M5",
-        "session_start": 7, "session_end": 19,
-        "max_spread": 3.0, "min_rr": 2.0, "lookback": 30, "risk": 0.5,
-    },
-    # Bot 15
-    {
-        "bot_id": 15, "magic": 1015,
-        "symbols": list(_MAJOR_PAIRS), "timeframe": "M5",
-        "session_start": 7, "session_end": 19,
-        "max_spread": 3.0, "min_rr": 2.2, "lookback": 30, "risk": 0.5,
-    },
-    # Bot 16
-    {
-        "bot_id": 16, "magic": 1016,
-        "symbols": list(_MAJOR_PAIRS), "timeframe": "M5",
-        "session_start": 7, "session_end": 19,
-        "max_spread": 3.0, "min_rr": 4.0, "lookback": 30, "risk": 0.5,
-    },
-    # Bot 17
-    {
-        "bot_id": 17, "magic": 1017,
-        "symbols": list(_MAJOR_PAIRS), "timeframe": "M5",
-        "session_start": 7, "session_end": 19,
-        "max_spread": 3.0, "min_rr": 2.5, "lookback": 30, "risk": 0.5,
-    },
-    # Bot 18
-    {
-        "bot_id": 18, "magic": 1018,
-        "symbols": list(_MAJOR_PAIRS), "timeframe": "M5",
-        "session_start": 7, "session_end": 19,
-        "max_spread": 3.0, "min_rr": 2.0, "lookback": 30, "risk": 0.5,
-    },
-    # Bot 19
-    {
-        "bot_id": 19, "magic": 1019,
-        "symbols": list(_MAJOR_PAIRS), "timeframe": "M5",
-        "session_start": 7, "session_end": 19,
-        "max_spread": 3.0, "min_rr": 2.2, "lookback": 30, "risk": 0.5,
-    },
-    # Bot 20
-    {
-        "bot_id": 20, "magic": 1020,
-        "symbols": list(_MAJOR_PAIRS), "timeframe": "M5",
-        "session_start": 7, "session_end": 19,
-        "max_spread": 3.0, "min_rr": 2.5, "lookback": 30, "risk": 0.5,
+        "variant": "Streng",
+        "min_rr": 2.5, "lookback": 20,
+        "daily_bias_filter": "very_strong",
+        "liquidity_pool_filter": True,
     },
 ]
+
+# ---------------------------------------------------------------------------
+# Build 20 bot configs (5 sets × 4 variants)
+# Bot IDs: 1-4 → Set-1 variants, 5-8 → Set-2, …, 17-20 → Set-5
+# Magic numbers: 1001–1020
+# ---------------------------------------------------------------------------
+
+BOT_CONFIGS: list[dict] = []
+_bot_counter = 1
+
+for _top_set in _TOP5_PARAMS:
+    for _var in _VARIANT_DEFS:
+        _min_rr = (
+            _top_set["min_rr"] if _var["min_rr"] is None else _var["min_rr"]
+        )
+        _lookback = (
+            _top_set["lookback"] if _var["lookback"] is None else _var["lookback"]
+        )
+        _bot_name = f"Bot_{_top_set['set_id']:02d}_{_var['variant']}"
+        BOT_CONFIGS.append(
+            {
+                "bot_id":               _bot_counter,
+                "bot_name":             _bot_name,
+                "magic":                1000 + _bot_counter,
+                "symbols":              list(_MAJOR_PAIRS),
+                "timeframe":            "M5",
+                "session_start":        7,
+                "session_end":          19,
+                "max_spread":           3.0,
+                "min_rr":               _min_rr,
+                "lookback":             _lookback,
+                "risk":                 0.5,
+                "daily_bias_filter":    _var["daily_bias_filter"],
+                "liquidity_pool_filter": _var["liquidity_pool_filter"],
+            }
+        )
+        _bot_counter += 1
 
 
 # ---------------------------------------------------------------------------
@@ -350,12 +305,13 @@ _TRADE_CSV_COLUMNS = [
 
 
 def _csv_path(bot_id: int) -> Path:
-    return _BOT_DIR / f"trades_bot_{bot_id:02d}.csv"
+    return _TRADES_DIR / f"trades_bot_{bot_id:02d}.csv"
 
 
 def _ensure_csv(bot_id: int) -> None:
-    """Create the trades CSV with a header row if it does not exist yet."""
+    """Create the trades CSV (and its parent directory) if not present yet."""
     path = _csv_path(bot_id)
+    path.parent.mkdir(parents=True, exist_ok=True)
     if not path.exists():
         with path.open("w", newline="", encoding="utf-8") as fh:
             writer = csv.DictWriter(fh, fieldnames=_TRADE_CSV_COLUMNS)
@@ -445,22 +401,58 @@ def _get_total_pnl(bot_id: int) -> float:
 
 
 # ---------------------------------------------------------------------------
-# Logging setup (per-bot)
+# Logging setup (per-bot) and central manager log
 # ---------------------------------------------------------------------------
 
-def _make_logger(bot_id: int) -> logging.Logger:
-    """Return a Logger that writes to bot_XX.log."""
-    name = f"smc_bot_{bot_id:02d}"
+def _ensure_dirs() -> None:
+    """Create logs/ and trades/ directories if they do not exist yet."""
+    _LOGS_DIR.mkdir(parents=True, exist_ok=True)
+    _TRADES_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def _setup_manager_logging() -> None:
+    """Configure the root logger to write to logs/manager.log + stdout."""
+    _ensure_dirs()
+    root = logging.getLogger()
+    if any(isinstance(h, logging.FileHandler) for h in root.handlers):
+        return  # already set up
+    root.setLevel(logging.INFO)
+    log_path = _LOGS_DIR / "manager.log"
+    fh = logging.FileHandler(log_path, encoding="utf-8")
+    fh.setLevel(logging.INFO)
+    fh.setFormatter(
+        logging.Formatter(
+            "%(asctime)s  %(name)s  %(levelname)-5s  %(message)s",
+            datefmt="%Y-%m-%d %H:%M:%S",
+        )
+    )
+    ch = logging.StreamHandler()
+    ch.setLevel(logging.INFO)
+    ch.setFormatter(
+        logging.Formatter(
+            "%(asctime)s  %(name)s  %(levelname)-5s  %(message)s",
+            datefmt="%Y-%m-%d %H:%M:%S",
+        )
+    )
+    root.addHandler(fh)
+    root.addHandler(ch)
+
+
+def _make_logger(bot_id: int, bot_name: str = "") -> logging.Logger:
+    """Return a Logger that writes to logs/bot_XX.log."""
+    label = bot_name or f"Bot {bot_id:02d}"
+    name  = f"smc_bot_{bot_id:02d}"
     logger = logging.getLogger(name)
     if logger.handlers:
         return logger  # already configured (e.g. after fork on macOS)
     logger.setLevel(logging.DEBUG)
-    log_path = _BOT_DIR / f"bot_{bot_id:02d}.log"
+    _ensure_dirs()
+    log_path = _LOGS_DIR / f"bot_{bot_id:02d}.log"
     fh = logging.FileHandler(log_path, encoding="utf-8")
     fh.setLevel(logging.DEBUG)
     fh.setFormatter(
         logging.Formatter(
-            f"%(asctime)s  [Bot {bot_id:02d}]  %(levelname)-5s  %(message)s",
+            f"%(asctime)s  [{label}]  %(levelname)-5s  %(message)s",
             datefmt="%Y-%m-%d %H:%M:%S",
         )
     )
@@ -785,9 +777,11 @@ def run_single_bot(config: dict) -> None:
     Parameters
     ----------
     config : dict
-        Keys: ``bot_id``, ``magic``, ``symbols``, ``timeframe``,
+        Keys: ``bot_id``, ``bot_name``, ``magic``, ``symbols``, ``timeframe``,
         ``session_start``, ``session_end``, ``max_spread``,
-        ``min_rr``, ``lookback``, ``risk``, ``data_queue``.
+        ``min_rr``, ``lookback``, ``risk``,
+        ``daily_bias_filter``, ``liquidity_pool_filter``,
+        ``data_queue``.
         ``data_queue`` is a :class:`multiprocessing.Queue` fed by the
         DataManager process.  Each queue item is a
         ``(symbol, tf, dataframe)`` tuple pushed on every bar close.
@@ -795,6 +789,7 @@ def run_single_bot(config: dict) -> None:
         instead of making its own REST calls for candle data.
     """
     bot_id: int = config["bot_id"]
+    bot_name: str = config.get("bot_name", f"Bot {bot_id:02d}")
     magic: int = config["magic"]
     symbols: list[str] = config["symbols"]
     timeframe: str = config["timeframe"]
@@ -804,11 +799,13 @@ def run_single_bot(config: dict) -> None:
     min_rr: float = config.get("min_rr", _MIN_RR)
     lookback: int = config.get("lookback", _LOOKBACK)
     risk_percent: float = config.get("risk", _RISK_PERCENT)
+    daily_bias_filter: str = config.get("daily_bias_filter", "normal")
+    liq_pool_filter: bool = config.get("liquidity_pool_filter", True)
     data_queue = config.get("data_queue")
-    bot_label = f"Bot {bot_id:02d}"
+    bot_label = bot_name
 
     # Set up per-bot logger
-    logger = _make_logger(bot_id)
+    logger = _make_logger(bot_id, bot_name)
 
     # Each child process must re-read env vars (needed after os.fork on Unix)
     try:
@@ -1066,6 +1063,102 @@ def run_single_bot(config: dict) -> None:
                     continue
 
                 # ── Signal passed all filters ─────────────────────────────
+
+                # ── daily_bias_filter ─────────────────────────────────────
+                # "off"         → always pass
+                # "weak"        → any BOS in lookback window
+                # "normal"      → BOS aligned with trade direction
+                # "very_strong" → BOS + FVG + price-position + liq sweep
+                if daily_bias_filter != "off":
+                    if daily_bias_filter in ("weak", "normal", "very_strong"):
+                        if not (has_bull_bos or has_bear_bos):
+                            logger.info(
+                                "[%s] Filtered (daily_bias=%s): No BOS detected",
+                                symbol, daily_bias_filter,
+                            )
+                            continue
+
+                    if daily_bias_filter in ("normal", "very_strong"):
+                        if signal == 1 and not has_bull_bos:
+                            logger.info(
+                                "[%s] Filtered (daily_bias=%s): No bullish BOS for LONG",
+                                symbol, daily_bias_filter,
+                            )
+                            continue
+                        if signal == -1 and not has_bear_bos:
+                            logger.info(
+                                "[%s] Filtered (daily_bias=%s): No bearish BOS for SHORT",
+                                symbol, daily_bias_filter,
+                            )
+                            continue
+
+                    if daily_bias_filter == "very_strong":
+                        discount_50_raw = last_closed.get("discount_50", np.nan)
+                        discount_50_f = (
+                            float(discount_50_raw)
+                            if not pd.isna(discount_50_raw) else np.nan
+                        )
+                        close_price = float(last_closed["close"])
+                        in_discount = (
+                            close_price < discount_50_f
+                            if not np.isnan(discount_50_f) else False
+                        )
+                        in_premium = (
+                            close_price > discount_50_f
+                            if not np.isnan(discount_50_f) else False
+                        )
+                        liq_below = bool(lb_slice["liquidity_swept_below"].max())
+                        liq_above = bool(lb_slice["liquidity_swept_above"].max())
+
+                        meets_bull_criteria = (
+                            has_bull_fvg and has_bull_bos and liq_below and in_discount
+                        )
+                        meets_bear_criteria = (
+                            has_bear_fvg and has_bear_bos and liq_above and in_premium
+                        )
+
+                        if signal == 1 and not meets_bull_criteria:
+                            logger.info(
+                                "[%s] Filtered (daily_bias=very_strong): "
+                                "Incomplete LONG alignment "
+                                "(bull_fvg=%s bull_bos=%s liq_below=%s discount=%s)",
+                                symbol, has_bull_fvg, has_bull_bos, liq_below, in_discount,
+                            )
+                            continue
+                        if signal == -1 and not meets_bear_criteria:
+                            logger.info(
+                                "[%s] Filtered (daily_bias=very_strong): "
+                                "Incomplete SHORT alignment "
+                                "(bear_fvg=%s bear_bos=%s liq_above=%s premium=%s)",
+                                symbol, has_bear_fvg, has_bear_bos, liq_above, in_premium,
+                            )
+                            continue
+
+                # ── liquidity_pool_filter ─────────────────────────────────
+                if liq_pool_filter:
+                    pool_above_raw = last_closed.get("liquidity_pool_above", np.nan)
+                    pool_below_raw = last_closed.get("liquidity_pool_below", np.nan)
+                    pool_above_f = (
+                        float(pool_above_raw)
+                        if not pd.isna(pool_above_raw) else np.nan
+                    )
+                    pool_below_f = (
+                        float(pool_below_raw)
+                        if not pd.isna(pool_below_raw) else np.nan
+                    )
+                    if signal == 1 and np.isnan(pool_above_f):
+                        logger.info(
+                            "[%s] Filtered (liq_pool=on): No liquidity pool above for LONG",
+                            symbol,
+                        )
+                        continue
+                    if signal == -1 and np.isnan(pool_below_f):
+                        logger.info(
+                            "[%s] Filtered (liq_pool=on): No liquidity pool below for SHORT",
+                            symbol,
+                        )
+                        continue
+
                 direction_str = "LONG" if signal == 1 else "SHORT"
                 entry = float(last_closed["entry"])
                 sl = float(last_closed["sl"])
@@ -1163,6 +1256,11 @@ def main(bot_ids: list[int] | None = None) -> None:
         If given, only start bots whose ``bot_id`` is in this list.
         Defaults to all 20 bots.
     """
+    # ── Create folder structure and set up central manager log ──────────────
+    _ensure_dirs()
+    _setup_manager_logging()
+    manager_log = logging.getLogger("manager")
+
     # Resolve credentials so they can be passed to the DataManager process
     try:
         from dotenv import load_dotenv as _dl  # type: ignore
@@ -1175,6 +1273,9 @@ def main(bot_ids: list[int] | None = None) -> None:
     environment = os.getenv("ENVIRONMENT", "practice").strip().lower()
 
     if not account_id or not access_token:
+        manager_log.error(
+            "ACCOUNT_ID and ACCESS_TOKEN must be set in the .env file."
+        )
         print("ERROR: ACCOUNT_ID and ACCESS_TOKEN must be set in the .env file.")
         return
 
@@ -1182,18 +1283,29 @@ def main(bot_ids: list[int] | None = None) -> None:
     if bot_ids:
         configs = [c for c in BOT_CONFIGS if c["bot_id"] in bot_ids]
     if not configs:
+        manager_log.error("No matching bot configurations found.")
         print("No matching bot configurations found.")
         return
 
+    manager_log.info(
+        "Starting DataManager + %d bot(s). Logs → %s, Trades → %s",
+        len(configs), _LOGS_DIR, _TRADES_DIR,
+    )
     print(f"Starting DataManager + {len(configs)} bot(s) …")
+    print(f"  Logs   → {_LOGS_DIR}")
+    print(f"  Trades → {_TRADES_DIR}")
     for cfg in configs:
-        print(
-            f"  Bot {cfg['bot_id']:02d}  symbols={len(cfg['symbols'])} pairs  "
-            f"tf={cfg['timeframe']:<4}  magic={cfg['magic']}  "
-            f"spread≤{cfg.get('max_spread', _MAX_SPREAD_PIPS):.1f}  "
+        _bname = cfg.get("bot_name") or f"Bot {cfg['bot_id']:02d}"
+        line = (
+            f"  {_bname:<28}  "
+            f"magic={cfg['magic']}  "
             f"RR≥{cfg.get('min_rr', _MIN_RR):.1f}  "
-            f"risk={cfg.get('risk', _RISK_PERCENT):.1f}%"
+            f"lookback={cfg.get('lookback', _LOOKBACK)}  "
+            f"bias={cfg.get('daily_bias_filter', 'normal'):<12}  "
+            f"liq_pool={'on' if cfg.get('liquidity_pool_filter', True) else 'off'}"
         )
+        print(line)
+        manager_log.info(line.strip())
 
     # ── Create one queue per bot ─────────────────────────────────────────────
     # Each queue receives (symbol, tf, df) tuples from the DataManager whenever
@@ -1203,13 +1315,16 @@ def main(bot_ids: list[int] | None = None) -> None:
     ]
 
     # ── Start the DataManager process ────────────────────────────────────────
+    logs_dir_str = str(_LOGS_DIR)
     dm_process = multiprocessing.Process(
         target=run_data_manager,
-        args=(account_id, access_token, list(_MAJOR_PAIRS), environment, bot_queues),
+        args=(account_id, access_token, list(_MAJOR_PAIRS), environment, bot_queues,
+              logs_dir_str),
         name="DataManager",
         daemon=False,
     )
     dm_process.start()
+    manager_log.info("DataManager process started (preloading history …)")
     print("DataManager process started (preloading history …)")
 
     # ── Start each bot process ───────────────────────────────────────────────
@@ -1219,7 +1334,7 @@ def main(bot_ids: list[int] | None = None) -> None:
         p = multiprocessing.Process(
             target=run_single_bot,
             args=(cfg_with_queue,),
-            name=f"SMCBot-{cfg['bot_id']:02d}",
+            name=cfg.get("bot_name", f"SMCBot-{cfg['bot_id']:02d}"),
             daemon=False,
         )
         p.start()
@@ -1227,13 +1342,16 @@ def main(bot_ids: list[int] | None = None) -> None:
         # Small stagger to avoid all bots hammering the OANDA account API
         time.sleep(0.5)
 
-    print(f"{len(processes) - 1} bot process(es) started.  Press Ctrl+C to stop all.")
+    msg = f"{len(processes) - 1} bot process(es) started.  Press Ctrl+C to stop all."
+    manager_log.info(msg)
+    print(msg)
 
     try:
         for p in processes:
             p.join()
     except KeyboardInterrupt:
         print("\nShutting down DataManager and all bots …")
+        manager_log.info("KeyboardInterrupt – shutting down all processes.")
         for p in processes:
             if p.is_alive():
                 p.terminate()
@@ -1274,19 +1392,23 @@ if __name__ == "__main__":
 
     if args.list_bots:
         print(
-            f"{'ID':>4}  {'Magic':>6}  {'Spread':>7}  {'MinRR':>6}  "
-            f"{'Lookback':>8}  {'Risk%':>6}  {'Session':>12}  TF"
+            f"{'ID':>4}  {'Name':<28}  {'Magic':>6}  {'MinRR':>6}  "
+            f"{'Lookback':>8}  {'DailyBias':<12}  {'LiqPool':>7}  "
+            f"{'Risk%':>6}  TF"
         )
-        print("-" * 70)
+        print("-" * 100)
         for cfg in BOT_CONFIGS:
-            sess = f"{cfg.get('session_start', _SESSION_START_HOUR):02d}-{cfg.get('session_end', _SESSION_END_HOUR):02d}h"
+            _bname = cfg.get("bot_name") or f"Bot {cfg['bot_id']:02d}"
             print(
-                f"{cfg['bot_id']:>4}  {cfg['magic']:>6}  "
-                f"{cfg.get('max_spread', _MAX_SPREAD_PIPS):>7.1f}  "
+                f"{cfg['bot_id']:>4}  "
+                f"{_bname:<28}  "
+                f"{cfg['magic']:>6}  "
                 f"{cfg.get('min_rr', _MIN_RR):>6.1f}  "
-                f"{cfg.get('lookback', 10):>8}  "
+                f"{cfg.get('lookback', _LOOKBACK):>8}  "
+                f"{cfg.get('daily_bias_filter', 'normal'):<12}  "
+                f"{'on' if cfg.get('liquidity_pool_filter', True) else 'off':>7}  "
                 f"{cfg.get('risk', _RISK_PERCENT):>6.1f}  "
-                f"{sess:>12}  {cfg['timeframe']}"
+                f"{cfg['timeframe']}"
             )
     else:
         selected_ids: list[int] | None = None
