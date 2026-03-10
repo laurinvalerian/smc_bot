@@ -153,7 +153,7 @@ from data_manager import run_data_manager
 # ---------------------------------------------------------------------------
 _SESSION_START_HOUR = 8    # 08:00 London time
 _SESSION_END_HOUR = 17     # 17:00 London time (exclusive)
-_MAX_SPREAD_PIPS = 1.8
+_MAX_SPREAD_PIPS = 3.0
 _RISK_PERCENT = 1.0        # % of account balance risked per trade
 _MIN_RR = 2.0
 _LOOKBACK = 30             # Rolling-window size (bars) for signal detection
@@ -202,28 +202,28 @@ BOT_CONFIGS: list[dict] = [
         "bot_id": 3, "magic": 1003,
         "symbols": list(_MAJOR_PAIRS), "timeframe": "M5",
         "session_start": 7, "session_end": 19,
-        "max_spread": 2.5, "min_rr": 2.5, "lookback": 30, "risk": 0.5,
+        "max_spread": 3.0, "min_rr": 2.5, "lookback": 30, "risk": 0.5,
     },
     # Bot 4
     {
         "bot_id": 4, "magic": 1004,
         "symbols": list(_MAJOR_PAIRS), "timeframe": "M5",
         "session_start": 7, "session_end": 19,
-        "max_spread": 2.5, "min_rr": 3.0, "lookback": 30, "risk": 0.5,
+        "max_spread": 3.0, "min_rr": 3.0, "lookback": 30, "risk": 0.5,
     },
     # Bot 5
     {
         "bot_id": 5, "magic": 1005,
         "symbols": list(_MAJOR_PAIRS), "timeframe": "M5",
         "session_start": 7, "session_end": 19,
-        "max_spread": 2.2, "min_rr": 2.5, "lookback": 30, "risk": 0.5,
+        "max_spread": 3.0, "min_rr": 2.5, "lookback": 30, "risk": 0.5,
     },
     # Bot 6
     {
         "bot_id": 6, "magic": 1006,
         "symbols": list(_MAJOR_PAIRS), "timeframe": "M5",
         "session_start": 7, "session_end": 19,
-        "max_spread": 2.2, "min_rr": 3.0, "lookback": 30, "risk": 0.5,
+        "max_spread": 3.0, "min_rr": 3.0, "lookback": 30, "risk": 0.5,
     },
     # Bot 7
     {
@@ -237,7 +237,7 @@ BOT_CONFIGS: list[dict] = [
         "bot_id": 8, "magic": 1008,
         "symbols": list(_MAJOR_PAIRS), "timeframe": "M5",
         "session_start": 7, "session_end": 19,
-        "max_spread": 2.5, "min_rr": 1.8, "lookback": 30, "risk": 0.5,
+        "max_spread": 3.0, "min_rr": 1.8, "lookback": 30, "risk": 0.5,
     },
     # Bot 9
     {
@@ -251,7 +251,7 @@ BOT_CONFIGS: list[dict] = [
         "bot_id": 10, "magic": 1010,
         "symbols": list(_MAJOR_PAIRS), "timeframe": "M5",
         "session_start": 7, "session_end": 19,
-        "max_spread": 2.2, "min_rr": 1.8, "lookback": 30, "risk": 0.5,
+        "max_spread": 3.0, "min_rr": 1.8, "lookback": 30, "risk": 0.5,
     },
     # Bot 11
     {
@@ -265,7 +265,7 @@ BOT_CONFIGS: list[dict] = [
         "bot_id": 12, "magic": 1012,
         "symbols": list(_MAJOR_PAIRS), "timeframe": "M5",
         "session_start": 7, "session_end": 19,
-        "max_spread": 2.5, "min_rr": 4.0, "lookback": 30, "risk": 0.5,
+        "max_spread": 3.0, "min_rr": 4.0, "lookback": 30, "risk": 0.5,
     },
     # Bot 13
     {
@@ -279,49 +279,49 @@ BOT_CONFIGS: list[dict] = [
         "bot_id": 14, "magic": 1014,
         "symbols": list(_MAJOR_PAIRS), "timeframe": "M5",
         "session_start": 7, "session_end": 19,
-        "max_spread": 2.5, "min_rr": 2.0, "lookback": 30, "risk": 0.5,
+        "max_spread": 3.0, "min_rr": 2.0, "lookback": 30, "risk": 0.5,
     },
     # Bot 15
     {
         "bot_id": 15, "magic": 1015,
         "symbols": list(_MAJOR_PAIRS), "timeframe": "M5",
         "session_start": 7, "session_end": 19,
-        "max_spread": 2.5, "min_rr": 2.2, "lookback": 30, "risk": 0.5,
+        "max_spread": 3.0, "min_rr": 2.2, "lookback": 30, "risk": 0.5,
     },
     # Bot 16
     {
         "bot_id": 16, "magic": 1016,
         "symbols": list(_MAJOR_PAIRS), "timeframe": "M5",
         "session_start": 7, "session_end": 19,
-        "max_spread": 2.2, "min_rr": 4.0, "lookback": 30, "risk": 0.5,
+        "max_spread": 3.0, "min_rr": 4.0, "lookback": 30, "risk": 0.5,
     },
     # Bot 17
     {
         "bot_id": 17, "magic": 1017,
         "symbols": list(_MAJOR_PAIRS), "timeframe": "M5",
         "session_start": 7, "session_end": 19,
-        "max_spread": 2.0, "min_rr": 2.5, "lookback": 30, "risk": 0.5,
+        "max_spread": 3.0, "min_rr": 2.5, "lookback": 30, "risk": 0.5,
     },
     # Bot 18
     {
         "bot_id": 18, "magic": 1018,
         "symbols": list(_MAJOR_PAIRS), "timeframe": "M5",
         "session_start": 7, "session_end": 19,
-        "max_spread": 2.2, "min_rr": 2.0, "lookback": 30, "risk": 0.5,
+        "max_spread": 3.0, "min_rr": 2.0, "lookback": 30, "risk": 0.5,
     },
     # Bot 19
     {
         "bot_id": 19, "magic": 1019,
         "symbols": list(_MAJOR_PAIRS), "timeframe": "M5",
         "session_start": 7, "session_end": 19,
-        "max_spread": 2.2, "min_rr": 2.2, "lookback": 30, "risk": 0.5,
+        "max_spread": 3.0, "min_rr": 2.2, "lookback": 30, "risk": 0.5,
     },
     # Bot 20
     {
         "bot_id": 20, "magic": 1020,
         "symbols": list(_MAJOR_PAIRS), "timeframe": "M5",
         "session_start": 7, "session_end": 19,
-        "max_spread": 1.8, "min_rr": 2.5, "lookback": 30, "risk": 0.5,
+        "max_spread": 3.0, "min_rr": 2.5, "lookback": 30, "risk": 0.5,
     },
 ]
 
@@ -895,11 +895,6 @@ def run_single_bot(config: dict) -> None:
                 time.sleep(_POLL_INTERVAL_SECONDS)
                 continue
 
-            # ── Session filter ───────────────────────────────────────────
-            if not _in_session(now_utc, session_start, session_end):
-                time.sleep(_POLL_INTERVAL_SECONDS)
-                continue
-
             # ── Max open trades guard (per bot, counted from CSV) ────────
             open_count = len(_get_open_trade_ids(bot_id))
             if open_count >= _MAX_OPEN_TRADES:
@@ -923,14 +918,6 @@ def run_single_bot(config: dict) -> None:
                     )
                     break
 
-                # Spread filter (per symbol)
-                spread = _get_spread_pips(client, account_id, symbol, logger)
-                if spread >= max_spread:
-                    logger.debug(
-                        "[%s] Spread %.3f pips too wide – skipping.", symbol, spread
-                    )
-                    continue
-
                 # Use DataFrame from local cache (populated by DataManager queue)
                 df = local_dfs.get(symbol)
                 if df is None or len(df) < 50:
@@ -943,6 +930,7 @@ def run_single_bot(config: dict) -> None:
                     continue
                 last_bar_times[symbol] = current_bar_time
 
+                # ── Generate signals (needed to detect potential FVG/BOS) ─
                 try:
                     sig_df = generate_signals(
                         df,
@@ -960,10 +948,124 @@ def run_single_bot(config: dict) -> None:
                 last_closed = sig_df.iloc[-2] if len(sig_df) >= 2 else sig_df.iloc[-1]
                 signal = int(last_closed["signal"])
 
-                if signal == 0 or np.isnan(last_closed["entry"]):
-                    logger.debug("[%s] No signal on latest closed bar.", symbol)
+                # ── Check for recent FVG/BOS patterns in lookback window ──
+                lb_start = max(0, len(sig_df) - lookback - 1)
+                lb_slice = sig_df.iloc[lb_start:-1]
+                has_bull_fvg = bool(lb_slice["fvg_bullish"].max())
+                has_bear_fvg = bool(lb_slice["fvg_bearish"].max())
+                has_bull_bos = bool((lb_slice["bos_direction"] == 1).any())
+                has_bear_bos = bool((lb_slice["bos_direction"] == -1).any())
+                has_potential = has_bull_fvg or has_bear_fvg or has_bull_bos or has_bear_bos
+
+                if not has_potential:
+                    logger.info("[%s] No signal on latest closed M5 bar", symbol)
                     continue
 
+                # ── Potential FVG/BOS setup detected ─────────────────────
+                logger.info("Potential FVG/BOS detected on %s M5", symbol)
+
+                # ── Filter: Trading session ───────────────────────────────
+                if not _in_session(now_utc, session_start, session_end):
+                    logger.info("[%s] Filtered: Not in trading session", symbol)
+                    continue
+
+                # ── Filter: Spread (API call only when there is potential) ─
+                spread = _get_spread_pips(client, account_id, symbol, logger)
+                if spread >= max_spread:
+                    logger.info(
+                        "[%s] Filtered: Spread %.1f > %.1f", symbol, spread, max_spread
+                    )
+                    continue
+
+                # ── Filter analysis when signal == 0 ─────────────────────
+                if signal == 0 or np.isnan(last_closed["entry"]):
+                    close_price = float(last_closed["close"])
+                    discount_50_raw = last_closed.get("discount_50", np.nan)
+                    discount_50_f = (
+                        float(discount_50_raw)
+                        if not pd.isna(discount_50_raw)
+                        else np.nan
+                    )
+                    pool_above_raw = last_closed.get("liquidity_pool_above", np.nan)
+                    pool_below_raw = last_closed.get("liquidity_pool_below", np.nan)
+                    pool_above_f = (
+                        float(pool_above_raw) if not pd.isna(pool_above_raw) else np.nan
+                    )
+                    pool_below_f = (
+                        float(pool_below_raw) if not pd.isna(pool_below_raw) else np.nan
+                    )
+                    liq_below_recent = bool(lb_slice["liquidity_swept_below"].max())
+                    liq_above_recent = bool(lb_slice["liquidity_swept_above"].max())
+                    in_discount = (
+                        close_price < discount_50_f if not np.isnan(discount_50_f)
+                        else False
+                    )
+                    in_premium = (
+                        close_price > discount_50_f if not np.isnan(discount_50_f)
+                        else False
+                    )
+
+                    # Log: daily bias (BOS direction)
+                    if not (has_bull_bos or has_bear_bos):
+                        logger.info(
+                            "[%s] Filtered: Daily bias not bullish/bearish", symbol
+                        )
+
+                    # Log: liquidity pool for TP target
+                    if np.isnan(pool_above_f) and np.isnan(pool_below_f):
+                        logger.info(
+                            "[%s] Filtered: No liquidity pool nearby", symbol
+                        )
+
+                    # Log: potential RR for long setup
+                    if (
+                        has_bull_fvg and has_bull_bos
+                        and liq_below_recent and in_discount
+                        and not np.isnan(pool_above_f)
+                    ):
+                        sl_raw = last_closed.get("swing_low_level", np.nan)
+                        sl_val = (
+                            float(sl_raw) if not pd.isna(sl_raw) else np.nan
+                        )
+                        if (
+                            not np.isnan(sl_val)
+                            and sl_val < close_price < pool_above_f
+                        ):
+                            sl_dist = close_price - sl_val
+                            if sl_dist > 0:
+                                rr_potential = (pool_above_f - close_price) / sl_dist
+                                if rr_potential < min_rr:
+                                    logger.info(
+                                        "[%s] Filtered: RR only %.1f < min_rr %.1f",
+                                        symbol, rr_potential, min_rr,
+                                    )
+
+                    # Log: potential RR for short setup
+                    elif (
+                        has_bear_fvg and has_bear_bos
+                        and liq_above_recent and in_premium
+                        and not np.isnan(pool_below_f)
+                    ):
+                        sl_raw = last_closed.get("swing_high_level", np.nan)
+                        sl_val = (
+                            float(sl_raw) if not pd.isna(sl_raw) else np.nan
+                        )
+                        if (
+                            not np.isnan(sl_val)
+                            and pool_below_f < close_price < sl_val
+                        ):
+                            sl_dist = sl_val - close_price
+                            if sl_dist > 0:
+                                rr_potential = (close_price - pool_below_f) / sl_dist
+                                if rr_potential < min_rr:
+                                    logger.info(
+                                        "[%s] Filtered: RR only %.1f < min_rr %.1f",
+                                        symbol, rr_potential, min_rr,
+                                    )
+
+                    continue
+
+                # ── Signal passed all filters ─────────────────────────────
                 direction_str = "LONG" if signal == 1 else "SHORT"
                 entry = float(last_closed["entry"])
                 sl = float(last_closed["sl"])
@@ -975,6 +1077,9 @@ def run_single_bot(config: dict) -> None:
                     logger.warning("[%s] Invalid signal values; skipping.", symbol)
                     continue
 
+                logger.info(
+                    "[%s] Signal valid! Placing order... Magic %d", symbol, magic
+                )
                 logger.info(
                     "[%s] Signal: %s @ %.5f  sl=%.5f  tp=%.5f  RR=%.2f  lot=%.2f",
                     symbol, direction_str, entry, sl, tp, rr, lot,
