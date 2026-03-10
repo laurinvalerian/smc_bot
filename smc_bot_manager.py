@@ -969,19 +969,19 @@ def run_single_bot(config: dict) -> None:
                     logger.info("[%s] Filtered: Not in trading session", symbol)
                     continue
 
-                # ── Filter: Spread (API call only when there is potential) ─
+                # ── Skip if no actionable signal on last closed bar ───────
+                # (checked before the spread API call to avoid a redundant
+                #  _get_spread_pips request when the signal is already 0)
+                if signal == 0 or np.isnan(last_closed.get("entry", np.nan)):
+                    continue
+
+                # ── Filter: Spread (API call only when signal is actionable) ─
                 spread = _get_spread_pips(client, account_id, symbol, logger)
                 if spread >= max_spread:
                     logger.info(
                         "[%s] Filtered: Spread %.1f > %.1f", symbol, spread, max_spread
                     )
                     continue
-
-                # ── Skip if no actionable signal on last closed bar ───────
-                if signal == 0 or np.isnan(last_closed.get("entry", np.nan)):
-                    continue
-
-                # ── Signal passed all filters ─────────────────────────────
 
                 # ── daily_bias_filter ─────────────────────────────────────
                 # "off"         → always pass
