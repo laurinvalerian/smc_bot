@@ -6,6 +6,13 @@ Each of the 20 bots is identified by a unique **Magic Number** (1001–1020)
 that is embedded in the OANDA order's ``clientExtensions.id``.  All 20 bots
 run in parallel via :mod:`multiprocessing`.
 
+A single **DataManager** process (from ``data_manager.py``) preloads history
+once on start-up (500 bars each for M5, H4, D1) and then streams live prices
+via the OANDA v20 Pricing Stream.  Whenever a bar closes the DataManager
+pushes ``(symbol, tf, dataframe)`` tuples to each bot's dedicated
+:class:`multiprocessing.Queue`.  Bots drain their queues every cycle instead
+of making their own REST calls for candle data.
+
 Bot configuration
 -----------------
 * All 20 bots trade **all 10 major FX pairs simultaneously** on M5 – identical
@@ -53,7 +60,7 @@ Create a ``.env`` file in the same directory with:
 Ubuntu / tmux Quick-Start
 --------------------------
     # 1. Install dependencies (once):
-    pip install oandapyV20 pandas numpy smartmoneyconcepts pytz python-dotenv
+    pip install oandapyV20 requests pandas numpy smartmoneyconcepts pytz python-dotenv
 
     # 2. Create / edit your .env file with credentials.
 
@@ -139,6 +146,7 @@ except ImportError:  # pragma: no cover
     _LONDON_TZ = None  # type: ignore
 
 from smc_strategy import generate_signals
+from data_manager import run_data_manager
 
 # ---------------------------------------------------------------------------
 # Global constants (mirrors live_bot.py defaults)
@@ -150,6 +158,7 @@ _RISK_PERCENT = 1.0        # % of account balance risked per trade
 _MIN_RR = 2.0
 _LOOKBACK = 30             # Rolling-window size (bars) for signal detection
 _MAX_DAILY_LOSS_PCT = 3.0  # % of start-of-day equity
+_MAX_OPEN_TRADES = 3       # Max open trades per bot (counted from CSV)
 _POLL_INTERVAL_SECONDS = 60
 _BARS_NEEDED = 200
 
@@ -778,9 +787,12 @@ def run_single_bot(config: dict) -> None:
     config : dict
         Keys: ``bot_id``, ``magic``, ``symbols``, ``timeframe``,
         ``session_start``, ``session_end``, ``max_spread``,
-        ``min_rr``, ``lookback``, ``risk``.
-        Each bot trades **all symbols** in the list simultaneously (multi-symbol
-        mode identical to ``live_bot.py``).
+        ``min_rr``, ``lookback``, ``risk``, ``data_queue``.
+        ``data_queue`` is a :class:`multiprocessing.Queue` fed by the
+        DataManager process.  Each queue item is a
+        ``(symbol, tf, dataframe)`` tuple pushed on every bar close.
+        The bot caches the latest DataFrame per symbol and uses it
+        instead of making its own REST calls for candle data.
     """
     bot_id: int = config["bot_id"]
     magic: int = config["magic"]
@@ -792,6 +804,7 @@ def run_single_bot(config: dict) -> None:
     min_rr: float = config.get("min_rr", _MIN_RR)
     lookback: int = config.get("lookback", _LOOKBACK)
     risk_percent: float = config.get("risk", _RISK_PERCENT)
+    data_queue = config.get("data_queue")
     bot_label = f"Bot {bot_id:02d}"
 
     # Set up per-bot logger
@@ -829,18 +842,16 @@ def run_single_bot(config: dict) -> None:
     # Ensure CSV exists
     _ensure_csv(bot_id)
 
-    granularity = _TF_MAP.get(timeframe.upper())
-    if granularity is None:
-        logger.error("Unknown timeframe '%s'.", timeframe)
-        return
-
     client = _oanda_init(account_id, access_token, environment, logger)
     if client is None:
         return
 
     daily_guard = DailyGuard()
 
-    # Per-symbol tracking of the last processed bar time
+    # Local DataFrame cache populated from data_queue: {symbol: DataFrame}
+    local_dfs: dict[str, "pd.DataFrame | None"] = {sym: None for sym in symbols}
+
+    # Per-symbol tracking of the last processed bar time (new-bar guard)
     last_bar_times: dict[str, "pd.Timestamp | None"] = {sym: None for sym in symbols}
 
     logger.info(
@@ -858,6 +869,16 @@ def run_single_bot(config: dict) -> None:
         while True:
             now_utc = datetime.now(timezone.utc)
             today_int = now_utc.date().toordinal()
+
+            # ── Drain the DataManager queue into our local cache ─────────
+            if data_queue is not None:
+                while True:
+                    try:
+                        sym_key, tf_key, df_update = data_queue.get_nowait()
+                        if sym_key in local_dfs and tf_key == timeframe:
+                            local_dfs[sym_key] = df_update
+                    except Exception:  # noqa: BLE001
+                        break  # queue empty
 
             equity = _get_equity(client, account_id, logger)
             daily_guard.update(equity, today_int)
@@ -910,9 +931,10 @@ def run_single_bot(config: dict) -> None:
                     )
                     continue
 
-                # Fetch OHLCV
-                df = _fetch_ohlcv(client, symbol, granularity, _BARS_NEEDED, logger)
+                # Use DataFrame from local cache (populated by DataManager queue)
+                df = local_dfs.get(symbol)
                 if df is None or len(df) < 50:
+                    logger.debug("[%s] Awaiting DataManager data.", symbol)
                     continue
 
                 # New-bar guard (per symbol)
@@ -1028,7 +1050,7 @@ def run_single_bot(config: dict) -> None:
 # ---------------------------------------------------------------------------
 
 def main(bot_ids: list[int] | None = None) -> None:
-    """Start all (or a subset of) bot processes.
+    """Start the DataManager and all (or a subset of) bot processes.
 
     Parameters
     ----------
@@ -1036,6 +1058,21 @@ def main(bot_ids: list[int] | None = None) -> None:
         If given, only start bots whose ``bot_id`` is in this list.
         Defaults to all 20 bots.
     """
+    # Resolve credentials so they can be passed to the DataManager process
+    try:
+        from dotenv import load_dotenv as _dl  # type: ignore
+        _dl(dotenv_path=Path(__file__).parent / ".env")
+    except ImportError:
+        _load_dotenv()
+
+    account_id = os.getenv("ACCOUNT_ID", "").strip()
+    access_token = os.getenv("ACCESS_TOKEN", "").strip()
+    environment = os.getenv("ENVIRONMENT", "practice").strip().lower()
+
+    if not account_id or not access_token:
+        print("ERROR: ACCOUNT_ID and ACCESS_TOKEN must be set in the .env file.")
+        return
+
     configs = BOT_CONFIGS
     if bot_ids:
         configs = [c for c in BOT_CONFIGS if c["bot_id"] in bot_ids]
@@ -1043,7 +1080,7 @@ def main(bot_ids: list[int] | None = None) -> None:
         print("No matching bot configurations found.")
         return
 
-    print(f"Starting {len(configs)} bot(s) …")
+    print(f"Starting DataManager + {len(configs)} bot(s) …")
     for cfg in configs:
         print(
             f"  Bot {cfg['bot_id']:02d}  symbols={len(cfg['symbols'])} pairs  "
@@ -1053,32 +1090,51 @@ def main(bot_ids: list[int] | None = None) -> None:
             f"risk={cfg.get('risk', _RISK_PERCENT):.1f}%"
         )
 
-    processes: list[multiprocessing.Process] = []
-    for cfg in configs:
+    # ── Create one queue per bot ─────────────────────────────────────────────
+    # Each queue receives (symbol, tf, df) tuples from the DataManager whenever
+    # a new bar closes.  maxsize prevents unbounded memory growth if a bot lags.
+    bot_queues = [
+        multiprocessing.Queue(maxsize=2000) for _ in configs
+    ]
+
+    # ── Start the DataManager process ────────────────────────────────────────
+    dm_process = multiprocessing.Process(
+        target=run_data_manager,
+        args=(account_id, access_token, list(_MAJOR_PAIRS), environment, bot_queues),
+        name="DataManager",
+        daemon=False,
+    )
+    dm_process.start()
+    print("DataManager process started (preloading history …)")
+
+    # ── Start each bot process ───────────────────────────────────────────────
+    processes: list[multiprocessing.Process] = [dm_process]
+    for cfg, q in zip(configs, bot_queues):
+        cfg_with_queue = {**cfg, "data_queue": q}
         p = multiprocessing.Process(
             target=run_single_bot,
-            args=(cfg,),
+            args=(cfg_with_queue,),
             name=f"SMCBot-{cfg['bot_id']:02d}",
             daemon=False,
         )
         p.start()
         processes.append(p)
-        # Small stagger to avoid all bots hammering the API simultaneously
+        # Small stagger to avoid all bots hammering the OANDA account API
         time.sleep(0.5)
 
-    print(f"{len(processes)} bot process(es) started.  Press Ctrl+C to stop all.")
+    print(f"{len(processes) - 1} bot process(es) started.  Press Ctrl+C to stop all.")
 
     try:
         for p in processes:
             p.join()
     except KeyboardInterrupt:
-        print("\nShutting down all bots …")
+        print("\nShutting down DataManager and all bots …")
         for p in processes:
             if p.is_alive():
                 p.terminate()
         for p in processes:
             p.join(timeout=5)
-        print("All bots stopped.")
+        print("All processes stopped.")
 
 
 # ---------------------------------------------------------------------------
