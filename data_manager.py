@@ -463,6 +463,20 @@ def run_data_manager(
     """
     from pathlib import Path as _Path
 
+    # ── Reset any logging handlers inherited from the parent process via
+    # os.fork().  logging.basicConfig() is a no-op when the root logger
+    # already has handlers; without this reset the DataManager's preload and
+    # stream logs would go to inherited parent file descriptors (manager.log
+    # opened in the parent) instead of the freshly-configured handlers below,
+    # causing the "Preloaded 500 EURUSD M5 bars" messages to almost disappear.
+    _root_logger = logging.getLogger()
+    for _h in _root_logger.handlers[:]:
+        try:
+            _root_logger.removeHandler(_h)
+            _h.close()
+        except OSError:
+            pass
+
     handlers: List[logging.Handler] = [logging.StreamHandler()]
     if log_dir:
         _ld = _Path(log_dir)

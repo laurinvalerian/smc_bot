@@ -160,6 +160,32 @@ from smc_strategy import generate_signals
 from data_manager import run_data_manager
 
 # ---------------------------------------------------------------------------
+# Fork-safety: reinitialise the Python logging module lock in every child
+# process created via os.fork() (the Linux default for multiprocessing).
+#
+# Root cause of the bot_01 silent-crash:
+#   The parent starts the AccountUpdater *thread*, which may hold the logging
+#   module lock at the exact instant the very first bot process is forked.
+#   The child inherits the lock in a *locked* state; since the thread that
+#   holds it does not exist in the child, the lock can never be released.
+#   Any subsequent logging call inside that child deadlocks silently → the
+#   bot_01.log file stays empty and the process hangs before doing any work.
+#   Later bots are shielded by the time.sleep(0.5) stagger between forks.
+#
+# Fix: register before/after_in_parent/after_in_child hooks so the lock is
+# always in a clean, released state when a child process starts.
+# ---------------------------------------------------------------------------
+if hasattr(os, "register_at_fork"):
+    _log_acquire = getattr(logging, "_acquireLock", None)
+    _log_release = getattr(logging, "_releaseLock", None)
+    if _log_acquire and _log_release:
+        os.register_at_fork(
+            before=_log_acquire,
+            after_in_parent=_log_release,
+            after_in_child=_log_release,
+        )
+
+# ---------------------------------------------------------------------------
 # Global constants (mirrors live_bot.py defaults)
 # ---------------------------------------------------------------------------
 _SESSION_START_HOUR = 8    # 08:00 London time
@@ -459,6 +485,7 @@ def _make_logger(bot_id: int, bot_name: str = "") -> logging.Logger:
         )
     )
     logger.addHandler(fh)
+    logger.propagate = False  # Do not propagate bot logs to root / manager.log
     return logger
 
 
@@ -823,6 +850,50 @@ def run_single_bot(config: dict) -> None:
     bot_id: int = config["bot_id"]
     bot_name: str = config.get("bot_name", f"Bot {bot_id:02d}")
     magic: int = config["magic"]
+
+    # ── Early stdout fallback ────────────────────────────────────────────────
+    # This print() is intentionally before any logging call.  It is visible
+    # even if the logger fails to initialise (e.g. due to a deadlocked lock
+    # inherited via os.fork) and is the only reliable signal that the child
+    # process actually started.
+    print(
+        f"[{bot_name}] process starting (PID={os.getpid()}, magic={magic})",
+        flush=True,
+    )
+
+    # ── Clear root-logger handlers inherited from the parent via os.fork() ──
+    # The parent's handlers share file descriptors with the child; leaving
+    # them in place causes garbled writes to manager.log from inside bot
+    # processes.  Removing them before _make_logger() ensures the bot writes
+    # exclusively to its own bot_XX.log file.
+    _rl = logging.getLogger()
+    for _h in _rl.handlers[:]:
+        try:
+            _rl.removeHandler(_h)
+            _h.close()
+        except OSError:
+            pass
+
+    try:
+        _run_single_bot_impl(config, bot_id, bot_name, magic)
+    except Exception as exc:  # noqa: BLE001
+        import sys as _sys
+        import traceback as _tb
+        print(
+            f"[{bot_name}] FATAL: unhandled exception – {exc}",
+            flush=True,
+        )
+        _tb.print_exc()
+        _sys.exit(1)
+
+
+def _run_single_bot_impl(
+    config: dict,
+    bot_id: int,
+    bot_name: str,
+    magic: int,
+) -> None:
+    """Inner implementation of a single-bot worker (called from run_single_bot)."""
     symbols: list[str] = config["symbols"]
     timeframe: str = config["timeframe"]
     session_start: int = config.get("session_start", _SESSION_START_HOUR)
@@ -891,7 +962,7 @@ def run_single_bot(config: dict) -> None:
         session_start, session_end, max_spread, min_rr, lookback, risk_percent,
     )
     logger.info(
-        "Bot %s connected to DataManager queue – waiting for first bars...", bot_name
+        "%s connected to DataManager queue – waiting for first bars...", bot_name
     )
     telegram(
         f"🤖 {bot_label} started – {len(symbols)} pairs – tf={timeframe} – magic={magic} – "
