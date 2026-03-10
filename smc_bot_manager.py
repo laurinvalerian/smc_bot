@@ -95,6 +95,8 @@ import csv
 import logging
 import multiprocessing
 import os
+import queue
+import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -575,6 +577,32 @@ def _get_balance(client: "_OandaAPI", account_id: str, logger: logging.Logger) -
     return float(acct.get("balance", 0.0))
 
 
+def _account_updater_loop(
+    account_id: str,
+    access_token: str,
+    environment: str,
+    shared_account: dict,
+    stop_event: threading.Event,
+    logger: logging.Logger,
+) -> None:
+    """Background thread: refresh shared account summary once per poll interval.
+
+    This ensures *all* bot processes share a single AccountSummary REST call
+    per cycle instead of each bot issuing its own request.
+    """
+    if not _OANDA_AVAILABLE:
+        return
+    client = _OandaAPI(access_token=access_token, environment=environment)
+    while not stop_event.is_set():
+        acct = _get_account_summary(client, account_id, logger)
+        if acct:
+            balance = float(acct.get("balance", 0.0))
+            equity = float(acct.get("NAV", balance))
+            shared_account["balance"] = balance
+            shared_account["equity"] = equity
+        stop_event.wait(timeout=_POLL_INTERVAL_SECONDS)
+
+
 def _get_spread_pips(
     client: "_OandaAPI",
     account_id: str,
@@ -781,12 +809,16 @@ def run_single_bot(config: dict) -> None:
         ``session_start``, ``session_end``, ``max_spread``,
         ``min_rr``, ``lookback``, ``risk``,
         ``daily_bias_filter``, ``liquidity_pool_filter``,
-        ``data_queue``.
+        ``data_queue``, ``shared_account``.
         ``data_queue`` is a :class:`multiprocessing.Queue` fed by the
         DataManager process.  Each queue item is a
         ``(symbol, tf, dataframe)`` tuple pushed on every bar close.
-        The bot caches the latest DataFrame per symbol and uses it
-        instead of making its own REST calls for candle data.
+        The bot blocks on the queue instead of polling, eliminating the
+        "Awaiting DataManager data" log spam.
+        ``shared_account`` is a :class:`multiprocessing.managers.DictProxy`
+        populated by the manager's background account-updater thread.  Bots
+        read ``balance`` and ``equity`` from it instead of issuing their own
+        AccountSummary REST calls.
     """
     bot_id: int = config["bot_id"]
     bot_name: str = config.get("bot_name", f"Bot {bot_id:02d}")
@@ -802,6 +834,7 @@ def run_single_bot(config: dict) -> None:
     daily_bias_filter: str = config.get("daily_bias_filter", "normal")
     liq_pool_filter: bool = config.get("liquidity_pool_filter", True)
     data_queue = config.get("data_queue")
+    shared_account = config.get("shared_account")
     bot_label = bot_name
 
     # Set up per-bot logger
@@ -857,36 +890,55 @@ def run_single_bot(config: dict) -> None:
         bot_label, ",".join(symbols), timeframe, magic, environment,
         session_start, session_end, max_spread, min_rr, lookback, risk_percent,
     )
+    logger.info(
+        "Bot %s connected to DataManager queue – waiting for first bars...", bot_name
+    )
     telegram(
         f"🤖 {bot_label} started – {len(symbols)} pairs – tf={timeframe} – magic={magic} – "
         f"session={session_start:02d}-{session_end:02d}h – spread≤{max_spread} – RR≥{min_rr}"
     )
 
+    # Local balance/equity updated from the shared account dict (no API calls in bots)
+    balance: float = 0.0
+    equity: float = 0.0
+
     try:
         while True:
+            # ── Block until a new bar tuple arrives from the DataManager ──
+            try:
+                item = data_queue.get(timeout=1.0)
+            except queue.Empty:
+                continue
+
+            if item is None:
+                logger.info("%s received shutdown sentinel.", bot_label)
+                break
+
+            sym_key, tf_key, df_update = item
+
+            # Only process items for our configured timeframe
+            if tf_key != timeframe or sym_key not in local_dfs:
+                continue
+
+            local_dfs[sym_key] = df_update
+            symbol = sym_key
+
             now_utc = datetime.now(timezone.utc)
             today_int = now_utc.date().toordinal()
 
-            # ── Drain the DataManager queue into our local cache ─────────
-            if data_queue is not None:
-                while True:
-                    try:
-                        sym_key, tf_key, df_update = data_queue.get_nowait()
-                        if sym_key in local_dfs and tf_key == timeframe:
-                            local_dfs[sym_key] = df_update
-                    except Exception:  # noqa: BLE001
-                        break  # queue empty
-
-            # Single AccountSummary call per cycle – provides both equity and balance.
-            # NAV (Net Asset Value) is used as equity; balance is the cash component.
-            # If the API call fails, _get_account_summary returns {} and both
-            # values default to 0.0 (the error is already logged inside that helper).
-            _acct = _get_account_summary(client, account_id, logger)
-            balance = float(_acct.get("balance", 0.0))
-            equity = float(_acct.get("NAV", balance))  # NAV primary, balance as fallback
+            # ── Read account data from shared state (no AccountSummary REST call) ─
+            if shared_account is not None:
+                _b = shared_account.get("balance")
+                _e = shared_account.get("equity")
+                if _b is not None:
+                    balance = float(_b)
+                if _e is not None:
+                    equity = float(_e)
+                else:
+                    equity = balance
             daily_guard.update(equity, today_int)
 
-            # ── Update PnL for any trades that closed since last cycle ───
+            # ── Update PnL for closed trades (once per new bar) ──────────
             _check_closed_trades(client, account_id, bot_id, logger)
 
             # ── Daily loss guard ─────────────────────────────────────────
@@ -895,7 +947,6 @@ def run_single_bot(config: dict) -> None:
                     "Daily loss limit (%.1f%%) reached – pausing until next day.",
                     _MAX_DAILY_LOSS_PCT,
                 )
-                time.sleep(_POLL_INTERVAL_SECONDS)
                 continue
 
             # ── Max open trades guard (per bot, counted from CSV) ────────
@@ -904,257 +955,239 @@ def run_single_bot(config: dict) -> None:
                 logger.info(
                     "Max open trades (%d) reached – skipping cycle.", open_count
                 )
-                time.sleep(_POLL_INTERVAL_SECONDS)
                 continue
 
-            # ── Iterate over every symbol in one loop pass ───────────────
-            for symbol in symbols:
-                # Re-check open trades cap before each symbol so we don't
-                # exceed the limit if a previous symbol in this cycle filled it.
-                if open_count >= _MAX_OPEN_TRADES:
+            # Use DataFrame from local cache (populated by DataManager queue)
+            df = local_dfs.get(symbol)
+            if df is None or len(df) < 50:
+                continue
+
+            # New-bar guard (per symbol)
+            current_bar_time = df.index[-1]
+            if current_bar_time == last_bar_times[symbol]:
+                continue
+            last_bar_times[symbol] = current_bar_time
+
+            # ── Generate signals (needed to detect potential FVG/BOS) ─
+            try:
+                sig_df = generate_signals(
+                    df,
+                    risk_percent=risk_percent,
+                    account_balance=balance,
+                    lookback=lookback,
+                    min_rr=min_rr,
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.error("[%s] generate_signals error: %s", symbol, exc)
+                continue
+
+            # Evaluate only the last *closed* bar (index -2;
+            # index -1 is the live candle still forming)
+            last_closed = sig_df.iloc[-2] if len(sig_df) >= 2 else sig_df.iloc[-1]
+            signal = int(last_closed["signal"])
+
+            # ── Check for recent FVG/BOS patterns in lookback window ──
+            lb_start = max(0, len(sig_df) - lookback - 1)
+            lb_slice = sig_df.iloc[lb_start:-1]
+            has_bull_fvg = bool(lb_slice["fvg_bullish"].max())
+            has_bear_fvg = bool(lb_slice["fvg_bearish"].max())
+            has_bull_bos = bool((lb_slice["bos_direction"] == 1).any())
+            has_bear_bos = bool((lb_slice["bos_direction"] == -1).any())
+            has_potential = has_bull_fvg or has_bear_fvg or has_bull_bos or has_bear_bos
+
+            if not has_potential:
+                logger.info("[%s] No signal on latest closed M5 bar", symbol)
+                continue
+
+            # ── Potential FVG/BOS setup detected ─────────────────────
+            logger.info("Potential FVG/BOS detected on %s M5", symbol)
+
+            # ── Filter: Trading session ───────────────────────────────
+            if not _in_session(now_utc, session_start, session_end):
+                logger.info("[%s] Filtered: Not in trading session", symbol)
+                continue
+
+            # ── Skip if no actionable signal on last closed bar ───────
+            # (checked before the spread API call to avoid a redundant
+            #  _get_spread_pips request when the signal is already 0)
+            if signal == 0 or np.isnan(last_closed.get("entry", np.nan)):
+                continue
+
+            # ── Filter: Spread (API call only when signal is actionable) ─
+            spread = _get_spread_pips(client, account_id, symbol, logger)
+            if spread >= max_spread:
+                logger.info(
+                    "[%s] Filtered: Spread %.1f > %.1f", symbol, spread, max_spread
+                )
+                continue
+
+            # ── daily_bias_filter ─────────────────────────────────────
+            # "off"         → always pass
+            # "weak"        → any BOS in lookback window
+            # "normal"      → BOS aligned with trade direction
+            # "very_strong" → BOS + FVG + price-position + liq sweep
+            if daily_bias_filter != "off":
+                if daily_bias_filter in ("weak", "normal", "very_strong"):
+                    if not (has_bull_bos or has_bear_bos):
+                        logger.info(
+                            "[%s] Filtered (daily_bias=%s): No BOS detected",
+                            symbol, daily_bias_filter,
+                        )
+                        continue
+
+                if daily_bias_filter in ("normal", "very_strong"):
+                    if signal == 1 and not has_bull_bos:
+                        logger.info(
+                            "[%s] Filtered (daily_bias=%s): No bullish BOS for LONG",
+                            symbol, daily_bias_filter,
+                        )
+                        continue
+                    if signal == -1 and not has_bear_bos:
+                        logger.info(
+                            "[%s] Filtered (daily_bias=%s): No bearish BOS for SHORT",
+                            symbol, daily_bias_filter,
+                        )
+                        continue
+
+                if daily_bias_filter == "very_strong":
+                    discount_50_raw = last_closed.get("discount_50", np.nan)
+                    discount_50_f = (
+                        float(discount_50_raw)
+                        if not pd.isna(discount_50_raw) else np.nan
+                    )
+                    close_price = float(last_closed["close"])
+                    in_discount = (
+                        close_price < discount_50_f
+                        if not np.isnan(discount_50_f) else False
+                    )
+                    in_premium = (
+                        close_price > discount_50_f
+                        if not np.isnan(discount_50_f) else False
+                    )
+                    liq_below = bool(lb_slice["liquidity_swept_below"].max())
+                    liq_above = bool(lb_slice["liquidity_swept_above"].max())
+
+                    meets_bull_criteria = (
+                        has_bull_fvg and has_bull_bos and liq_below and in_discount
+                    )
+                    meets_bear_criteria = (
+                        has_bear_fvg and has_bear_bos and liq_above and in_premium
+                    )
+
+                    if signal == 1 and not meets_bull_criteria:
+                        logger.info(
+                            "[%s] Filtered (daily_bias=very_strong): "
+                            "Incomplete LONG alignment "
+                            "(bull_fvg=%s bull_bos=%s liq_below=%s discount=%s)",
+                            symbol, has_bull_fvg, has_bull_bos, liq_below, in_discount,
+                        )
+                        continue
+                    if signal == -1 and not meets_bear_criteria:
+                        logger.info(
+                            "[%s] Filtered (daily_bias=very_strong): "
+                            "Incomplete SHORT alignment "
+                            "(bear_fvg=%s bear_bos=%s liq_above=%s premium=%s)",
+                            symbol, has_bear_fvg, has_bear_bos, liq_above, in_premium,
+                        )
+                        continue
+
+            # ── liquidity_pool_filter ─────────────────────────────────
+            if liq_pool_filter:
+                pool_above_raw = last_closed.get("liquidity_pool_above", np.nan)
+                pool_below_raw = last_closed.get("liquidity_pool_below", np.nan)
+                pool_above_f = (
+                    float(pool_above_raw)
+                    if not pd.isna(pool_above_raw) else np.nan
+                )
+                pool_below_f = (
+                    float(pool_below_raw)
+                    if not pd.isna(pool_below_raw) else np.nan
+                )
+                if signal == 1 and np.isnan(pool_above_f):
                     logger.info(
-                        "[%s] Max open trades reached mid-cycle – stopping symbol loop.",
+                        "[%s] Filtered (liq_pool=on): No liquidity pool above for LONG",
                         symbol,
                     )
-                    break
-
-                # Use DataFrame from local cache (populated by DataManager queue)
-                df = local_dfs.get(symbol)
-                if df is None or len(df) < 50:
-                    logger.debug("[%s] Awaiting DataManager data.", symbol)
                     continue
-
-                # New-bar guard (per symbol)
-                current_bar_time = df.index[-1]
-                if current_bar_time == last_bar_times[symbol]:
-                    continue
-                last_bar_times[symbol] = current_bar_time
-
-                # ── Generate signals (needed to detect potential FVG/BOS) ─
-                try:
-                    sig_df = generate_signals(
-                        df,
-                        risk_percent=risk_percent,
-                        account_balance=balance,
-                        lookback=lookback,
-                        min_rr=min_rr,
-                    )
-                except Exception as exc:  # noqa: BLE001
-                    logger.error("[%s] generate_signals error: %s", symbol, exc)
-                    continue
-
-                # Evaluate only the last *closed* bar (index -2;
-                # index -1 is the live candle still forming)
-                last_closed = sig_df.iloc[-2] if len(sig_df) >= 2 else sig_df.iloc[-1]
-                signal = int(last_closed["signal"])
-
-                # ── Check for recent FVG/BOS patterns in lookback window ──
-                lb_start = max(0, len(sig_df) - lookback - 1)
-                lb_slice = sig_df.iloc[lb_start:-1]
-                has_bull_fvg = bool(lb_slice["fvg_bullish"].max())
-                has_bear_fvg = bool(lb_slice["fvg_bearish"].max())
-                has_bull_bos = bool((lb_slice["bos_direction"] == 1).any())
-                has_bear_bos = bool((lb_slice["bos_direction"] == -1).any())
-                has_potential = has_bull_fvg or has_bear_fvg or has_bull_bos or has_bear_bos
-
-                if not has_potential:
-                    logger.info("[%s] No signal on latest closed M5 bar", symbol)
-                    continue
-
-                # ── Potential FVG/BOS setup detected ─────────────────────
-                logger.info("Potential FVG/BOS detected on %s M5", symbol)
-
-                # ── Filter: Trading session ───────────────────────────────
-                if not _in_session(now_utc, session_start, session_end):
-                    logger.info("[%s] Filtered: Not in trading session", symbol)
-                    continue
-
-                # ── Skip if no actionable signal on last closed bar ───────
-                # (checked before the spread API call to avoid a redundant
-                #  _get_spread_pips request when the signal is already 0)
-                if signal == 0 or np.isnan(last_closed.get("entry", np.nan)):
-                    continue
-
-                # ── Filter: Spread (API call only when signal is actionable) ─
-                spread = _get_spread_pips(client, account_id, symbol, logger)
-                if spread >= max_spread:
+                if signal == -1 and np.isnan(pool_below_f):
                     logger.info(
-                        "[%s] Filtered: Spread %.1f > %.1f", symbol, spread, max_spread
+                        "[%s] Filtered (liq_pool=on): No liquidity pool below for SHORT",
+                        symbol,
                     )
                     continue
 
-                # ── daily_bias_filter ─────────────────────────────────────
-                # "off"         → always pass
-                # "weak"        → any BOS in lookback window
-                # "normal"      → BOS aligned with trade direction
-                # "very_strong" → BOS + FVG + price-position + liq sweep
-                if daily_bias_filter != "off":
-                    if daily_bias_filter in ("weak", "normal", "very_strong"):
-                        if not (has_bull_bos or has_bear_bos):
-                            logger.info(
-                                "[%s] Filtered (daily_bias=%s): No BOS detected",
-                                symbol, daily_bias_filter,
-                            )
-                            continue
+            direction_str = "LONG" if signal == 1 else "SHORT"
+            entry = float(last_closed["entry"])
+            sl = float(last_closed["sl"])
+            tp = float(last_closed["tp"])
+            rr = float(last_closed["rr_ratio"])
+            lot = float(last_closed["lot_size"])
 
-                    if daily_bias_filter in ("normal", "very_strong"):
-                        if signal == 1 and not has_bull_bos:
-                            logger.info(
-                                "[%s] Filtered (daily_bias=%s): No bullish BOS for LONG",
-                                symbol, daily_bias_filter,
-                            )
-                            continue
-                        if signal == -1 and not has_bear_bos:
-                            logger.info(
-                                "[%s] Filtered (daily_bias=%s): No bearish BOS for SHORT",
-                                symbol, daily_bias_filter,
-                            )
-                            continue
+            if np.isnan(sl) or np.isnan(tp) or np.isnan(lot) or lot <= 0:
+                logger.warning("[%s] Invalid signal values; skipping.", symbol)
+                continue
 
-                    if daily_bias_filter == "very_strong":
-                        discount_50_raw = last_closed.get("discount_50", np.nan)
-                        discount_50_f = (
-                            float(discount_50_raw)
-                            if not pd.isna(discount_50_raw) else np.nan
-                        )
-                        close_price = float(last_closed["close"])
-                        in_discount = (
-                            close_price < discount_50_f
-                            if not np.isnan(discount_50_f) else False
-                        )
-                        in_premium = (
-                            close_price > discount_50_f
-                            if not np.isnan(discount_50_f) else False
-                        )
-                        liq_below = bool(lb_slice["liquidity_swept_below"].max())
-                        liq_above = bool(lb_slice["liquidity_swept_above"].max())
+            logger.info(
+                "[%s] Signal valid! Placing order... Magic %d", symbol, magic
+            )
+            logger.info(
+                "[%s] Signal: %s @ %.5f  sl=%.5f  tp=%.5f  RR=%.2f  lot=%.2f",
+                symbol, direction_str, entry, sl, tp, rr, lot,
+            )
 
-                        meets_bull_criteria = (
-                            has_bull_fvg and has_bull_bos and liq_below and in_discount
-                        )
-                        meets_bear_criteria = (
-                            has_bear_fvg and has_bear_bos and liq_above and in_premium
-                        )
+            # ── Place the order ──────────────────────────────────────
+            oanda_trade_id = _place_order(
+                client, account_id, symbol, signal, sl, tp, lot, magic, logger
+            )
 
-                        if signal == 1 and not meets_bull_criteria:
-                            logger.info(
-                                "[%s] Filtered (daily_bias=very_strong): "
-                                "Incomplete LONG alignment "
-                                "(bull_fvg=%s bull_bos=%s liq_below=%s discount=%s)",
-                                symbol, has_bull_fvg, has_bull_bos, liq_below, in_discount,
-                            )
-                            continue
-                        if signal == -1 and not meets_bear_criteria:
-                            logger.info(
-                                "[%s] Filtered (daily_bias=very_strong): "
-                                "Incomplete SHORT alignment "
-                                "(bear_fvg=%s bear_bos=%s liq_above=%s premium=%s)",
-                                symbol, has_bear_fvg, has_bear_bos, liq_above, in_premium,
-                            )
-                            continue
+            if oanda_trade_id is None:
+                continue
 
-                # ── liquidity_pool_filter ─────────────────────────────────
-                if liq_pool_filter:
-                    pool_above_raw = last_closed.get("liquidity_pool_above", np.nan)
-                    pool_below_raw = last_closed.get("liquidity_pool_below", np.nan)
-                    pool_above_f = (
-                        float(pool_above_raw)
-                        if not pd.isna(pool_above_raw) else np.nan
-                    )
-                    pool_below_f = (
-                        float(pool_below_raw)
-                        if not pd.isna(pool_below_raw) else np.nan
-                    )
-                    if signal == 1 and np.isnan(pool_above_f):
-                        logger.info(
-                            "[%s] Filtered (liq_pool=on): No liquidity pool above for LONG",
-                            symbol,
-                        )
-                        continue
-                    if signal == -1 and np.isnan(pool_below_f):
-                        logger.info(
-                            "[%s] Filtered (liq_pool=on): No liquidity pool below for SHORT",
-                            symbol,
-                        )
-                        continue
+            # ── Record in CSV ────────────────────────────────────────
+            ts_str = now_utc.strftime("%Y-%m-%d %H:%M:%S")
+            _append_trade(
+                bot_id,
+                {
+                    "timestamp": ts_str,
+                    "bot_id": bot_id,
+                    "magic": magic,
+                    "symbol": symbol,
+                    "timeframe": timeframe,
+                    "direction": direction_str,
+                    "entry": f"{entry:.5f}",
+                    "sl": f"{sl:.5f}",
+                    "tp": f"{tp:.5f}",
+                    "rr_ratio": f"{rr:.2f}",
+                    "lot_size": f"{lot:.2f}",
+                    "oanda_trade_id": oanda_trade_id,
+                    "status": "OPEN",
+                    "realized_pnl": "",
+                    "close_time": "",
+                },
+            )
 
-                direction_str = "LONG" if signal == 1 else "SHORT"
-                entry = float(last_closed["entry"])
-                sl = float(last_closed["sl"])
-                tp = float(last_closed["tp"])
-                rr = float(last_closed["rr_ratio"])
-                lot = float(last_closed["lot_size"])
+            # ── Compute PnL figures for Telegram ─────────────────────
+            total_pnl = _get_total_pnl(bot_id)
+            daily_pnl = _get_daily_pnl(bot_id)
+            pnl_sign = "+" if total_pnl >= 0 else ""
+            daily_sign = "+" if daily_pnl >= 0 else ""
 
-                if np.isnan(sl) or np.isnan(tp) or np.isnan(lot) or lot <= 0:
-                    logger.warning("[%s] Invalid signal values; skipping.", symbol)
-                    continue
+            # ── Telegram notification (bot number + symbol) ──────────
+            tg_msg = (
+                f"<b>{bot_label} ({symbol}) {direction_str} @ {entry:.5f}</b>\n"
+                f"RR {rr:.1f} | Magic {magic}\n"
+                f"SL: {sl:.5f} | TP: {tp:.5f}\n"
+                f"PnL: {pnl_sign}{total_pnl:.2f} USD | "
+                f"Daily PnL: {daily_sign}{daily_pnl:.2f} USD"
+            )
+            telegram(tg_msg)
 
-                logger.info(
-                    "[%s] Signal valid! Placing order... Magic %d", symbol, magic
-                )
-                logger.info(
-                    "[%s] Signal: %s @ %.5f  sl=%.5f  tp=%.5f  RR=%.2f  lot=%.2f",
-                    symbol, direction_str, entry, sl, tp, rr, lot,
-                )
-
-                # ── Place the order ──────────────────────────────────────
-                oanda_trade_id = _place_order(
-                    client, account_id, symbol, signal, sl, tp, lot, magic, logger
-                )
-
-                if oanda_trade_id is None:
-                    continue
-
-                # ── Record in CSV ────────────────────────────────────────
-                ts_str = now_utc.strftime("%Y-%m-%d %H:%M:%S")
-                _append_trade(
-                    bot_id,
-                    {
-                        "timestamp": ts_str,
-                        "bot_id": bot_id,
-                        "magic": magic,
-                        "symbol": symbol,
-                        "timeframe": timeframe,
-                        "direction": direction_str,
-                        "entry": f"{entry:.5f}",
-                        "sl": f"{sl:.5f}",
-                        "tp": f"{tp:.5f}",
-                        "rr_ratio": f"{rr:.2f}",
-                        "lot_size": f"{lot:.2f}",
-                        "oanda_trade_id": oanda_trade_id,
-                        "status": "OPEN",
-                        "realized_pnl": "",
-                        "close_time": "",
-                    },
-                )
-
-                # Increment open-count after successful fill
-                open_count += 1
-
-                # ── Compute PnL figures for Telegram ─────────────────────
-                total_pnl = _get_total_pnl(bot_id)
-                daily_pnl = _get_daily_pnl(bot_id)
-                pnl_sign = "+" if total_pnl >= 0 else ""
-                daily_sign = "+" if daily_pnl >= 0 else ""
-
-                # ── Telegram notification (bot number + symbol) ──────────
-                tg_msg = (
-                    f"<b>{bot_label} ({symbol}) {direction_str} @ {entry:.5f}</b>\n"
-                    f"RR {rr:.1f} | Magic {magic}\n"
-                    f"SL: {sl:.5f} | TP: {tp:.5f}\n"
-                    f"PnL: {pnl_sign}{total_pnl:.2f} USD | "
-                    f"Daily PnL: {daily_sign}{daily_pnl:.2f} USD"
-                )
-                telegram(tg_msg)
-
-                logger.info(
-                    "TRADE PLACED – [%s] %s @ %.5f | RR %.2f | Magic %d | "
-                    "trade_id=%s | PnL %.2f | Daily PnL %.2f",
-                    symbol, direction_str, entry, rr, magic,
-                    oanda_trade_id, total_pnl, daily_pnl,
-                )
-
-            time.sleep(_POLL_INTERVAL_SECONDS)
+            logger.info(
+                "TRADE PLACED – [%s] %s @ %.5f | RR %.2f | Magic %d | "
+                "trade_id=%s | PnL %.2f | Daily PnL %.2f",
+                symbol, direction_str, entry, rr, magic,
+                oanda_trade_id, total_pnl, daily_pnl,
+            )
 
     except KeyboardInterrupt:
         logger.info("%s stopped by user.", bot_label)
@@ -1232,6 +1265,26 @@ def main(bot_ids: list[int] | None = None) -> None:
         multiprocessing.Queue(maxsize=2000) for _ in configs
     ]
 
+    # ── Shared account state (populated by the account-updater thread) ────────
+    # All bot processes read balance/equity from this dict instead of issuing
+    # individual AccountSummary REST calls – reducing API traffic from 20×/cycle
+    # to 1×/cycle.
+    mp_mgr = multiprocessing.Manager()
+    shared_account = mp_mgr.dict({"balance": 0.0, "equity": 0.0})
+
+    # ── Start account-updater background thread ───────────────────────────────
+    _acct_stop = threading.Event()
+    _acct_thread = threading.Thread(
+        target=_account_updater_loop,
+        args=(account_id, access_token, environment, shared_account,
+              _acct_stop, manager_log),
+        name="AccountUpdater",
+        daemon=True,
+    )
+    _acct_thread.start()
+    manager_log.info("AccountUpdater thread started (1 AccountSummary call per %ds).",
+                     _POLL_INTERVAL_SECONDS)
+
     # ── Start the DataManager process ────────────────────────────────────────
     logs_dir_str = str(_LOGS_DIR)
     dm_process = multiprocessing.Process(
@@ -1248,7 +1301,7 @@ def main(bot_ids: list[int] | None = None) -> None:
     # ── Start each bot process ───────────────────────────────────────────────
     processes: list[multiprocessing.Process] = [dm_process]
     for cfg, q in zip(configs, bot_queues):
-        cfg_with_queue = {**cfg, "data_queue": q}
+        cfg_with_queue = {**cfg, "data_queue": q, "shared_account": shared_account}
         p = multiprocessing.Process(
             target=run_single_bot,
             args=(cfg_with_queue,),
@@ -1257,7 +1310,7 @@ def main(bot_ids: list[int] | None = None) -> None:
         )
         p.start()
         processes.append(p)
-        # Small stagger to avoid all bots hammering the OANDA account API
+        # Small stagger to spread initial queue-drain load
         time.sleep(0.5)
 
     msg = f"{len(processes) - 1} bot process(es) started.  Press Ctrl+C to stop all."
@@ -1270,11 +1323,14 @@ def main(bot_ids: list[int] | None = None) -> None:
     except KeyboardInterrupt:
         print("\nShutting down DataManager and all bots …")
         manager_log.info("KeyboardInterrupt – shutting down all processes.")
+        _acct_stop.set()
         for p in processes:
             if p.is_alive():
                 p.terminate()
         for p in processes:
             p.join(timeout=5)
+        _acct_thread.join(timeout=5)
+        mp_mgr.shutdown()
         print("All processes stopped.")
 
 
